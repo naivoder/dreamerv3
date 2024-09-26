@@ -414,7 +414,7 @@ class DreamerV3:
             self.critic.parameters(), lr=config.critic_lr, weight_decay=config.weight_decay
         )
 
-        self.replay_buffer = ReplayBuffer(config.replay_buffer_capacity, alpha=config.alpha)
+        self.replay_buffer = ReplayBuffer(config.replay_buffer_capacity)
 
         # Hidden states
         self.h = None
@@ -438,7 +438,7 @@ class DreamerV3:
 
     def update_world_model(self):
         batch = self.replay_buffer.sample_batch(
-            self.config.batch_size, self.config.seq_len, beta=self.beta
+            self.config.batch_size, self.config.seq_len
         )
         if batch[0] is None:
             print("No batch 🤷‍♀️")
@@ -482,11 +482,11 @@ class DreamerV3:
 
         # Update priorities
         priorities = loss_world.detach().cpu().numpy()
-        self.replay_buffer.update_priorities(idxs, priorities)
+        # self.replay_buffer.update_priorities(idxs, priorities)
 
     def update_actor_and_critic(self):
         # Imagined rollouts
-        batch = self.replay_buffer.sample_batch(self.config.batch_size, 1, beta=self.beta)
+        batch = self.replay_buffer.sample_batch(self.config.batch_size, 1)
         if batch[0] is None:
             print("No data 🤷‍♀️")
             return  # Not enough data to train
@@ -522,7 +522,7 @@ class DreamerV3:
         imag_values = []
         imag_action_probs = []
 
-        for _ in tqdm(range(self.config.imagination_horizon)):
+        for _ in range(self.config.imagination_horizon):
             # Compute prior over latent state
             prior_logits = self.world_model.prior_net(imag_h)
             prior_logits = prior_logits.view(
@@ -598,29 +598,29 @@ class DreamerV3:
         actor_loss += self.config.entropy_scale * entropy
         weighted_actor_loss = actor_loss * is_weights_flat
 
-        # # Separate losses
-        # total_actor_loss = weighted_actor_loss.mean()
-        # total_critic_loss = weighted_critic_loss.mean()
+        # Separate losses
+        total_actor_loss = weighted_actor_loss.mean()
+        total_critic_loss = weighted_critic_loss.mean()
 
-        # self.actor_optimizer.zero_grad()
-        # total_actor_loss.backward()
-        # torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.config.max_grad_norm)
-        # self.actor_optimizer.step()
-
-        # self.critic_optimizer.zero_grad()
-        # total_critic_loss.backward()
-        # torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.config.max_grad_norm)
-        # self.critic_optimizer.step()
-
-        # Combined losses
-        total_loss = (weighted_actor_loss + weighted_critic_loss).mean()
         self.actor_optimizer.zero_grad()
-        self.critic_optimizer.zero_grad()
-        total_loss.backward()
+        total_actor_loss.backward(retain_graph=True)
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.config.max_grad_norm)
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.config.max_grad_norm)
         self.actor_optimizer.step()
+
+        self.critic_optimizer.zero_grad()
+        total_critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.config.max_grad_norm)
         self.critic_optimizer.step()
+
+        # # Combined losses
+        # total_loss = (weighted_actor_loss + weighted_critic_loss).mean()
+        # self.actor_optimizer.zero_grad()
+        # self.critic_optimizer.zero_grad()
+        # total_loss.backward()
+        # torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.config.max_grad_norm)
+        # torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.config.max_grad_norm)
+        # self.actor_optimizer.step()
+        # self.critic_optimizer.step()
 
         # Update priorities based on TD-errors
         with torch.no_grad():
@@ -629,7 +629,7 @@ class DreamerV3:
                 dim=0
             )
             priorities = td_errors_batch.abs().cpu().numpy()
-            self.replay_buffer.update_priorities(idxs, priorities)
+            # self.replay_buffer.update_priorities(idxs, priorities)
 
         # Update target critic
         self._soft_update(self.target_critic, self.critic)
@@ -769,8 +769,7 @@ def train_dreamer(config):
             )
 
             if len(agent.replay_buffer) >= config.batch_size * config.seq_len:
-                if frame_idx % 1000 == 0:
-                    agent.train(num_updates=config.num_updates)
+                agent.train(num_updates=config.num_updates)
 
             if done:
                 total_rewards.append(episode_reward)
@@ -788,8 +787,8 @@ if __name__ == "__main__":
     parser.add_argument("--latent_dim", type=int, default=32)
     parser.add_argument("--latent_categories", type=int, default=32)
     parser.add_argument("--hidden_dim", type=int, default=4096)
-    parser.add_argument("--actor_lr", type=float, default=3e-4)
-    parser.add_argument("--critic_lr", type=float, default=3e-4)
+    parser.add_argument("--actor_lr", type=float, default=1e-3)
+    parser.add_argument("--critic_lr", type=float, default=1e-3)
     parser.add_argument("--world_lr", type=float, default=1e-3)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--imagination_horizon", type=int, default=15)
@@ -801,9 +800,9 @@ if __name__ == "__main__":
     parser.add_argument("--kl_balance_alpha", type=float, default=0.8)
     parser.add_argument("--alpha", type=float, default=0.6)
     parser.add_argument("--beta_start", type=float, default=0.4)
-    parser.add_argument("--beta_frames", type=int, default=100000)
-    parser.add_argument("--lambda_", type=float, default=0.95, help="Lambda for lambda returns")
-    parser.add_argument("--max_grad_norm", type=float, default=1000)
+    parser.add_argument("--beta_frames", type=int, default=10000)
+    parser.add_argument("--lambda_", type=float, default=0.95)
+    parser.add_argument("--max_grad_norm", type=float, default=1)
     parser.add_argument("--weight_decay", type=float, default=1e-6)
     parser.add_argument("--num_updates", type=int, default=5)
 
