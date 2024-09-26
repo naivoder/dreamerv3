@@ -6,27 +6,9 @@ import numpy as np
 import random
 from torchvision import transforms
 from collections import deque
+from tqdm import tqdm
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# Hyperparameters
-LATENT_DIM = 32  # Number of discrete latent variables
-LATENT_CATEGORIES = 32  # Number of categories for each variable
-HIDDEN_DIM = 256
-ACTOR_LR = 1e-3  # Increased learning rates for better learning
-CRITIC_LR = 1e-3
-WORLD_LR = 1e-3
-GAMMA = 0.99
-IMAGINATION_HORIZON = 15
-FREE_NATS = 0.1  # Reduced to make KL loss more influential
-BATCH_SIZE = 64  # Increased batch size
-SEQ_LEN = 50
-REPLAY_BUFFER_CAPACITY = 100000
-ENTROPY_SCALE = 0.1  # Increased to encourage exploration
-KL_BALANCE_ALPHA = 0.8  # For KL balancing between forward and reverse KL
-ALPHA = 0.6  # Prioritization exponent
-BETA_START = 0.4  # Initial beta value for importance sampling
-BETA_FRAMES = 100000  # Frames over which beta increases to 1
 
 
 # Symlog functions
@@ -59,6 +41,7 @@ class SumTree:
         self.tree = np.zeros(2 * capacity - 1)  # Binary tree structure
         self.data = [None] * capacity  # Stores actual transitions
         self.write = 0  # Points to the next index to write data
+        self.size = 0
 
     def _propagate(self, idx, change):
         parent = (idx - 1) // 2
@@ -92,6 +75,8 @@ class SumTree:
         self.write += 1
         if self.write >= self.capacity:
             self.write = 0  # Overwrite if capacity exceeded
+        if self.size < self.capacity:
+            self.size += 1
 
     def update(self, idx, priority):
         change = priority - self.tree[idx]
@@ -103,7 +88,7 @@ class SumTree:
         idx = self._retrieve(0, s)
         data_idx = idx - self.capacity + 1
 
-        return idx, self.tree[idx], self.data[data_idx]
+        return idx, self.tree[idx], self.data[data_idx % self.capacity]
 
 
 # Prioritized Replay Buffer with SumTree
@@ -117,6 +102,9 @@ class ReplayBuffer:
         self.tree = SumTree(capacity)
         self.alpha = alpha
         self.epsilon = 1e-6  # Small amount to avoid zero priority
+
+    def __len__(self):
+        return self.tree.size
 
     def store(self, transition):
         # Assign maximum priority to new transitions to ensure they are sampled at least once
@@ -137,30 +125,27 @@ class ReplayBuffer:
         priorities = []
 
         for i in range(batch_size):
-            s = random.uniform(segment * i, segment * (i + 1))
-            idx, priority, data = self.tree.get(s)
+            valid = False
+            while not valid:
+                s = random.uniform(segment * i, segment * (i + 1))
+                idx, priority, data = self.tree.get(s)
 
-            # Collect sequences
-            seq = []
-            for offset in range(seq_len):
-                idx_offset = idx + offset
-                if idx_offset >= self.tree.capacity * 2 - 1:
-                    break
-                data_idx = idx_offset - self.tree.capacity + 1
-                if data_idx >= self.capacity:
-                    data_idx -= self.capacity
-                seq_data = self.tree.data[data_idx]
-                if seq_data is None:
-                    break
-                seq.append(seq_data)
-            if len(seq) < seq_len:
-                continue  # Skip if not enough sequence data
+                # Collect sequences
+                seq = []
+                idx_offset = idx - self.capacity + 1
+                for offset in range(seq_len):
+                    data_idx = idx_offset + offset
+                    if data_idx >= self.capacity:
+                        data_idx -= self.capacity
+                    seq_data = self.tree.data[data_idx % self.capacity]
+                    if seq_data is None:
+                        break
+                    seq.append(seq_data)
+                if len(seq) == seq_len:
+                    valid = True
             batch.append(seq)
             idxs.append(idx)
             priorities.append(priority)
-
-        if len(batch) == 0:
-            return [None] * 7  # Not enough data
 
         sampling_probabilities = np.array(priorities) / self.tree.total()
         is_weights = np.power(self.tree.capacity * sampling_probabilities, -beta)
@@ -195,19 +180,20 @@ class ReplayBuffer:
 
 # Convolutional Encoder for Image Observations
 class ConvEncoder(nn.Module):
-    def __init__(self, obs_shape):
+    def __init__(self, obs_shape, config):
         super(ConvEncoder, self).__init__()
+        c, h, w = obs_shape
         self.conv_net = nn.Sequential(
-            nn.Conv2d(
-                obs_shape[0], 32, kernel_size=8, stride=4
-            ),  # Output: (32, 20, 20)
+            nn.Conv2d(c, 128, kernel_size=4, stride=2),  # Output: (128, h/2, w/2)
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),  # Output: (64, 9, 9)
+            nn.Conv2d(128, 256, kernel_size=4, stride=2),  # Output: (256, h/4, w/4)
             nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=3, stride=1),  # Output: (128, 7, 7)
+            nn.Conv2d(256, 512, kernel_size=4, stride=2),  # Output: (512, h/8, w/8)
+            nn.ReLU(),
+            nn.Conv2d(512, 512, kernel_size=4, stride=2),  # Output: (512, h/16, w/16)
             nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(128 * 7 * 7, HIDDEN_DIM),
+            nn.Linear(512 * (h // 16) * (w // 16), config.hidden_dim),
             nn.ReLU(),
         )
 
@@ -218,37 +204,40 @@ class ConvEncoder(nn.Module):
 
 # Convolutional Decoder for Reconstructing Image Observations
 class ConvDecoder(nn.Module):
-    def __init__(self, obs_shape):
+    def __init__(self, obs_shape, config):
         super(ConvDecoder, self).__init__()
+        c, h, w = obs_shape
         self.fc = nn.Sequential(
-            nn.Linear(HIDDEN_DIM + LATENT_DIM * LATENT_CATEGORIES, 128 * 7 * 7),
+            nn.Linear(config.hidden_dim + config.latent_dim * config.latent_categories, 512 * (h // 16) * (w // 16)),
             nn.ReLU(),
         )
         self.deconv_net = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=1),  # Output: (64, 9, 9)
+            nn.ConvTranspose2d(512, 512, kernel_size=4, stride=2),  # Output: (512, h/8, w/8)
             nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2),  # Output: (32, 20, 20)
+            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2),  # Output: (256, h/4, w/4)
             nn.ReLU(),
-            nn.ConvTranspose2d(
-                32, obs_shape[0], kernel_size=8, stride=4, output_padding=0
-            ),  # Output: (channels, 84, 84)
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2),  # Output: (128, h/2, w/2)
+            nn.ReLU(),
+            nn.ConvTranspose2d(128, c, kernel_size=4, stride=2),  # Output: (c, h, w)
             nn.Sigmoid(),  # Output pixel values between 0 and 1
         )
 
     def forward(self, x):
         x = self.fc(x)
-        x = x.view(-1, 128, 7, 7)
+        batch_size = x.size(0)
+        c, h, w = 512, self.obs_shape[1] // 16, self.obs_shape[2] // 16
+        x = x.view(batch_size, c, h, w)
         return self.deconv_net(x)
 
 
 # MLP Encoder for Vector Observations
 class MLPEncoder(nn.Module):
-    def __init__(self, obs_dim):
+    def __init__(self, obs_dim, config):
         super(MLPEncoder, self).__init__()
         self.net = nn.Sequential(
-            nn.Linear(obs_dim, HIDDEN_DIM),
+            nn.Linear(obs_dim, config.hidden_dim),
             nn.ReLU(),
-            nn.Linear(HIDDEN_DIM, HIDDEN_DIM),
+            nn.Linear(config.hidden_dim, config.hidden_dim),
             nn.ReLU(),
         )
 
@@ -258,12 +247,12 @@ class MLPEncoder(nn.Module):
 
 # MLP Decoder for Reconstructing Vector Observations
 class MLPDecoder(nn.Module):
-    def __init__(self, obs_dim):
+    def __init__(self, obs_dim, config):
         super(MLPDecoder, self).__init__()
         self.net = nn.Sequential(
-            nn.Linear(HIDDEN_DIM + LATENT_DIM * LATENT_CATEGORIES, HIDDEN_DIM),
+            nn.Linear(config.hidden_dim + config.latent_dim * config.latent_categories, config.hidden_dim),
             nn.ReLU(),
-            nn.Linear(HIDDEN_DIM, obs_dim),
+            nn.Linear(config.hidden_dim, obs_dim),
         )
 
     def forward(self, x):
@@ -272,29 +261,37 @@ class MLPDecoder(nn.Module):
 
 # World Model with Discrete Latent Representations and KL Balancing
 class WorldModel(nn.Module):
-    def __init__(self, obs_shape, act_dim, is_image):
+    def __init__(self, obs_shape, act_dim, is_image, config):
         super(WorldModel, self).__init__()
         self.is_image = is_image
         self.act_dim = act_dim
+        self.hidden_dim = config.hidden_dim
+        self.latent_dim = config.latent_dim
+        self.latent_categories = config.latent_categories
+        self.kl_balance_alpha = config.kl_balance_alpha
+        self.free_nats = config.free_nats
 
         if self.is_image:
-            self.obs_encoder = ConvEncoder(obs_shape)
-            self.obs_decoder = ConvDecoder(obs_shape)
             self.obs_shape = obs_shape
+            self.obs_encoder = ConvEncoder(obs_shape, config)
+            self.obs_decoder = ConvDecoder(obs_shape, config)
             self.obs_dim = None
         else:
             self.obs_dim = obs_shape[0]
-            self.obs_encoder = MLPEncoder(self.obs_dim)
-            self.obs_decoder = MLPDecoder(self.obs_dim)
+            self.obs_encoder = MLPEncoder(self.obs_dim, config)
+            self.obs_decoder = MLPDecoder(self.obs_dim, config)
             self.obs_shape = (self.obs_dim,)
+
         self.rnn = nn.GRU(
-            LATENT_DIM * LATENT_CATEGORIES + act_dim, HIDDEN_DIM, batch_first=True
+            config.latent_dim * config.latent_categories + act_dim, config.hidden_dim, batch_first=True
         )
-        self.prior_net = nn.Linear(HIDDEN_DIM, LATENT_DIM * LATENT_CATEGORIES)
+        self.prior_net = nn.Linear(config.hidden_dim, config.latent_dim * config.latent_categories)
         self.posterior_net = nn.Linear(
-            HIDDEN_DIM + HIDDEN_DIM, LATENT_DIM * LATENT_CATEGORIES
+            config.hidden_dim + config.hidden_dim, config.latent_dim * config.latent_categories
         )
-        self.reward_decoder = nn.Linear(HIDDEN_DIM + LATENT_DIM * LATENT_CATEGORIES, 1)
+        self.reward_decoder = nn.Linear(
+            config.hidden_dim + config.latent_dim * config.latent_categories, 1
+        )
 
     def forward(self, obs_seq, act_seq):
         batch_size, seq_len = obs_seq.size(0), obs_seq.size(1)
@@ -317,13 +314,13 @@ class WorldModel(nn.Module):
         ).float()
 
         # Initialize hidden state
-        h = torch.zeros(1, batch_size, HIDDEN_DIM, device=obs_seq.device)
+        h = torch.zeros(1, batch_size, self.hidden_dim, device=obs_seq.device)
 
         # Initialize posterior sample
         posterior_input = torch.cat([h.permute(1, 0, 2), obs_encoded[:, 0:1]], dim=-1)
         posterior_logits = self.posterior_net(posterior_input)
         posterior_logits = posterior_logits.view(
-            batch_size, LATENT_DIM, LATENT_CATEGORIES
+            batch_size, self.latent_dim, self.latent_categories
         )
         posterior_sample = gumbel_softmax(posterior_logits, hard=True).view(
             batch_size, 1, -1
@@ -341,37 +338,44 @@ class WorldModel(nn.Module):
             rnn_inputs.append(rnn_input)
             _, h = self.rnn(rnn_input, h)
             rnn_hidden_states.append(h.permute(1, 0, 2))
-            posterior_input = torch.cat([h.permute(1, 0, 2), obs_encoded[:, t + 1 : t + 2]], dim=-1)
+            posterior_input = torch.cat(
+                [h.permute(1, 0, 2), obs_encoded[:, t + 1 : t + 2]], dim=-1
+            )
             posterior_logits = self.posterior_net(posterior_input)
             posterior_logits = posterior_logits.view(
-                batch_size, LATENT_DIM, LATENT_CATEGORIES
+                batch_size, self.latent_dim, self.latent_categories
             )
             posterior_sample = gumbel_softmax(posterior_logits, hard=True).view(
                 batch_size, 1, -1
             )
             posterior_samples.append(posterior_sample)
 
-        rnn_inputs = torch.cat(rnn_inputs, dim=1)  # [batch_size, seq_len - 1, input_size]
-        rnn_hidden_states = torch.cat(rnn_hidden_states, dim=1)  # [batch_size, seq_len - 1, HIDDEN_DIM]
+        rnn_inputs = torch.cat(
+            rnn_inputs, dim=1
+        )  # [batch_size, seq_len - 1, input_size]
+        rnn_hidden_states = torch.cat(
+            rnn_hidden_states, dim=1
+        )  # [batch_size, seq_len - 1, hidden_dim]
         posterior_samples = torch.cat(posterior_samples[:-1], dim=1)
 
         # Compute prior logits
         prior_logits = self.prior_net(rnn_hidden_states)
         prior_logits = prior_logits.view(
-            batch_size, seq_len - 1, LATENT_DIM, LATENT_CATEGORIES
+            batch_size, seq_len - 1, self.latent_dim, self.latent_categories
         )
 
         # Compute KL divergence with KL balancing
         posterior_logits = []
         for t in range(seq_len - 1):
             posterior_input = torch.cat(
-                [rnn_hidden_states[:, t : t + 1], obs_encoded[:, t + 1 : t + 2]], dim=-1
+                [rnn_hidden_states[:, t : t + 1], obs_encoded[:, t + 1 : t + 2]],
+                dim=-1,
             )
             logits = self.posterior_net(posterior_input)
             posterior_logits.append(logits)
         posterior_logits = torch.stack(posterior_logits, dim=1)
         posterior_logits = posterior_logits.view(
-            batch_size, seq_len - 1, LATENT_DIM, LATENT_CATEGORIES
+            batch_size, seq_len - 1, self.latent_dim, self.latent_categories
         )
 
         posterior_sample = posterior_samples.view(batch_size, seq_len - 1, -1)
@@ -381,10 +385,14 @@ class WorldModel(nn.Module):
         # Decode observation and reward
         decoder_input = torch.cat([rnn_hidden_states, posterior_sample], dim=-1)
         if self.is_image:
-            recon_obs = self.obs_decoder(decoder_input.view(-1, decoder_input.size(-1)))
+            recon_obs = self.obs_decoder(
+                decoder_input.view(-1, decoder_input.size(-1))
+            )
             recon_obs = recon_obs.view(batch_size, seq_len - 1, *self.obs_shape)
         else:
-            recon_obs = self.obs_decoder(decoder_input.view(-1, decoder_input.size(-1)))
+            recon_obs = self.obs_decoder(
+                decoder_input.view(-1, decoder_input.size(-1))
+            )
             recon_obs = recon_obs.view(batch_size, seq_len - 1, *self.obs_shape)
         pred_reward = self.reward_decoder(decoder_input)
 
@@ -409,18 +417,21 @@ class WorldModel(nn.Module):
         ).sum(-1)
 
         kl_loss = (
-            KL_BALANCE_ALPHA * kl_div_forward + (1 - KL_BALANCE_ALPHA) * kl_div_reverse
+            self.kl_balance_alpha * kl_div_forward
+            + (1 - self.kl_balance_alpha) * kl_div_reverse
         )
-        kl_loss = torch.clamp(kl_loss, min=FREE_NATS).mean()
+        kl_loss = torch.clamp(kl_loss, min=self.free_nats).mean()
         return kl_loss
 
 
 # Actor Network for Discrete Actions with Entropy Regularization
 class Actor(nn.Module):
-    def __init__(self, state_dim, act_dim):
+    def __init__(self, state_dim, act_dim, config):
         super(Actor, self).__init__()
         self.net = nn.Sequential(
-            nn.Linear(state_dim, HIDDEN_DIM), nn.ReLU(), nn.Linear(HIDDEN_DIM, act_dim)
+            nn.Linear(state_dim, config.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(config.hidden_dim, act_dim),
         )
 
     def forward(self, x):
@@ -431,14 +442,12 @@ class Actor(nn.Module):
 
 # Critic Network with Twohot Encoding
 class Critic(nn.Module):
-    def __init__(self, state_dim):
+    def __init__(self, state_dim, config):
         super(Critic, self).__init__()
         self.net = nn.Sequential(
-            nn.Linear(state_dim, HIDDEN_DIM),
+            nn.Linear(state_dim, config.hidden_dim),
             nn.ReLU(),
-            nn.Linear(
-                HIDDEN_DIM, 51
-            ),  # Using 51 atoms for distributional value estimation
+            nn.Linear(config.hidden_dim, 51),  # Using 51 atoms
         )
         self.v_min = -10
         self.v_max = 10
@@ -453,38 +462,60 @@ class Critic(nn.Module):
 
     def get_q_values(self, probabilities):
         q_values = torch.sum(probabilities * self.support, dim=-1)
+        q_values = symexp(q_values)  # Apply symexp
         return q_values
 
 
 # DreamerV3 Agent
 class DreamerV3:
-    def __init__(self, obs_shape, act_dim, is_image):
+    def __init__(self, obs_shape, act_dim, is_image, config):
+        self.config = config
         self.obs_shape = obs_shape
         self.act_dim = act_dim
         self.is_image = is_image
 
-        self.world_model = WorldModel(obs_shape, act_dim, is_image).to(device)
-        self.actor = Actor(HIDDEN_DIM, act_dim).to(device)
-        self.critic = Critic(HIDDEN_DIM).to(device)
-        self.target_critic = Critic(HIDDEN_DIM).to(device)
+        self.world_model = WorldModel(obs_shape, act_dim, is_image, config).to(device)
+        self.actor = Actor(config.hidden_dim, act_dim, config).to(device)
+        self.critic = Critic(config.hidden_dim, config).to(device)
+        self.target_critic = Critic(config.hidden_dim, config).to(device)
         self.target_critic.load_state_dict(self.critic.state_dict())
 
-        self.world_optimizer = optim.Adam(self.world_model.parameters(), lr=WORLD_LR)
-        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=ACTOR_LR)
-        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=CRITIC_LR)
+        self.world_optimizer = optim.Adam(
+            self.world_model.parameters(), lr=config.world_lr, weight_decay=config.weight_decay
+        )
+        self.actor_optimizer = optim.Adam(
+            self.actor.parameters(), lr=config.actor_lr, weight_decay=config.weight_decay
+        )
+        self.critic_optimizer = optim.Adam(
+            self.critic.parameters(), lr=config.critic_lr, weight_decay=config.weight_decay
+        )
 
-        self.replay_buffer = ReplayBuffer(REPLAY_BUFFER_CAPACITY, alpha=ALPHA)
+        self.replay_buffer = ReplayBuffer(config.replay_buffer_capacity, alpha=config.alpha)
 
         # Hidden states
         self.h = None
         self.reset_hidden_states()
-        self.beta = BETA_START  # Importance sampling exponent
+        self.beta = config.beta_start  # Importance sampling exponent
+
+        # Initialize networks
+        self.world_model.apply(self.init_weights)
+        self.actor.apply(self.init_weights)
+        self.critic.apply(self.init_weights)
+        self.target_critic.apply(self.init_weights)
+
+    def init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
 
     def reset_hidden_states(self):
-        self.h = torch.zeros(1, 1, HIDDEN_DIM, device=device)
+        self.h = torch.zeros(1, 1, self.config.hidden_dim, device=device)
 
     def update_world_model(self):
-        batch = self.replay_buffer.sample_batch(BATCH_SIZE, SEQ_LEN, beta=self.beta)
+        batch = self.replay_buffer.sample_batch(
+            self.config.batch_size, self.config.seq_len, beta=self.beta
+        )
         if batch[0] is None:
             return  # Not enough data to train
 
@@ -520,6 +551,7 @@ class DreamerV3:
 
         self.world_optimizer.zero_grad()
         weighted_loss_world.backward()
+        torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), self.config.max_grad_norm)
         self.world_optimizer.step()
 
         # Update priorities
@@ -528,7 +560,7 @@ class DreamerV3:
 
     def update_actor_and_critic(self):
         # Imagined rollouts
-        batch = self.replay_buffer.sample_batch(BATCH_SIZE, 1, beta=self.beta)
+        batch = self.replay_buffer.sample_batch(self.config.batch_size, 1, beta=self.beta)
         if batch[0] is None:
             return  # Not enough data to train
 
@@ -536,26 +568,25 @@ class DreamerV3:
         obs = obs_seq[:, 0]
         is_weights = is_weights  # [batch_size]
 
-        h = torch.zeros(1, BATCH_SIZE, HIDDEN_DIM, device=device)
+        h = torch.zeros(1, self.config.batch_size, self.config.hidden_dim, device=device)
         if self.is_image:
             obs_encoded = self.world_model.obs_encoder(obs)
         else:
             obs_encoded = self.world_model.obs_encoder(obs)
 
-        h = h.permute(1, 0, 2)  # [batch_size, HIDDEN_DIM]
 
         # Initialize imag_h with h
-        imag_h = h.squeeze(1)  # [batch_size, HIDDEN_DIM]
+        imag_h = h.squeeze(0)  # [batch_size, hidden_dim]
 
         # Initialize imag_s with posterior sample from initial obs
         with torch.no_grad():
             posterior_input = torch.cat([imag_h, obs_encoded], dim=-1)
             posterior_logits = self.world_model.posterior_net(posterior_input)
             posterior_logits = posterior_logits.view(
-                BATCH_SIZE, LATENT_DIM, LATENT_CATEGORIES
+                self.config.batch_size, self.config.latent_dim, self.config.latent_categories
             )
             posterior_sample = gumbel_softmax(posterior_logits, hard=True).view(
-                BATCH_SIZE, -1
+                self.config.batch_size, -1
             )
             imag_s = posterior_sample
 
@@ -564,13 +595,13 @@ class DreamerV3:
         imag_values = []
         imag_action_probs = []
 
-        for _ in range(IMAGINATION_HORIZON):
+        for _ in tqdm(range(self.config.imagination_horizon)):
             # Compute prior over latent state
             prior_logits = self.world_model.prior_net(imag_h)
             prior_logits = prior_logits.view(
-                BATCH_SIZE, LATENT_DIM, LATENT_CATEGORIES
+                self.config.batch_size, self.config.latent_dim, self.config.latent_categories
             )
-            imag_s = gumbel_softmax(prior_logits, hard=True).view(BATCH_SIZE, -1)
+            imag_s = gumbel_softmax(prior_logits, hard=True).view(self.config.batch_size, -1)
 
             # Get action probabilities from actor
             action_probs = self.actor(imag_h)
@@ -605,18 +636,23 @@ class DreamerV3:
         imag_values = torch.stack(imag_values)  # [horizon, batch_size]
 
         returns = torch.zeros_like(imag_rewards)
-        next_value = torch.zeros(BATCH_SIZE, device=device)
+        next_value = imag_values[-1]
 
-        for t in reversed(range(IMAGINATION_HORIZON)):
-            next_value = imag_rewards[t] + GAMMA * next_value
+        for t in reversed(range(self.config.imagination_horizon)):
+            next_value = imag_rewards[t] + self.config.gamma * (
+                (1 - self.config.lambda_) * imag_values[t] + self.config.lambda_ * next_value
+            )
             returns[t] = next_value
 
         # Flatten tensors for loss computation
         imag_states_flat = torch.cat(
             imag_states, dim=0
-        )  # [horizon * batch_size, HIDDEN_DIM]
+        )  # [horizon * batch_size, hidden_dim]
         returns_flat = returns.view(-1)
-        is_weights_flat = is_weights.repeat(IMAGINATION_HORIZON)
+        is_weights_flat = is_weights.repeat(self.config.imagination_horizon)
+
+        # Apply symlog to returns
+        returns_flat = symlog(returns_flat)
 
         # Critic update with Twohot Encoding
         probs = self.critic(imag_states_flat)
@@ -627,27 +663,42 @@ class DreamerV3:
 
         # Actor update with Entropy Regularization
         imag_action_probs_flat = torch.cat(imag_action_probs, dim=0)
-        actor_loss = -q_values.detach()  # Detach to prevent gradients flowing into critic
+        q_values = self.critic.get_q_values(probs.detach())
+        actor_loss = -q_values  # Detach to prevent gradients flowing into critic
         entropy = -torch.sum(
             imag_action_probs_flat * torch.log(imag_action_probs_flat + 1e-8), dim=-1
         )
-        actor_loss += ENTROPY_SCALE * entropy
+        actor_loss += self.config.entropy_scale * entropy
         weighted_actor_loss = actor_loss * is_weights_flat
 
-        # Combine losses
-        total_loss = (weighted_actor_loss + weighted_critic_loss).mean()
+        # # Separate losses
+        # total_actor_loss = weighted_actor_loss.mean()
+        # total_critic_loss = weighted_critic_loss.mean()
 
-        # Backpropagate
+        # self.actor_optimizer.zero_grad()
+        # total_actor_loss.backward()
+        # torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.config.max_grad_norm)
+        # self.actor_optimizer.step()
+
+        # self.critic_optimizer.zero_grad()
+        # total_critic_loss.backward()
+        # torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.config.max_grad_norm)
+        # self.critic_optimizer.step()
+
+        # Combined losses
+        total_loss = (weighted_actor_loss + weighted_critic_loss).mean()
         self.actor_optimizer.zero_grad()
         self.critic_optimizer.zero_grad()
         total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.config.max_grad_norm)
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.config.max_grad_norm)
         self.actor_optimizer.step()
         self.critic_optimizer.step()
 
         # Update priorities based on TD-errors
         with torch.no_grad():
             td_errors = returns_flat - q_values
-            td_errors_batch = td_errors.view(IMAGINATION_HORIZON, BATCH_SIZE).mean(
+            td_errors_batch = td_errors.view(self.config.imagination_horizon, self.config.batch_size).mean(
                 dim=0
             )
             priorities = td_errors_batch.abs().cpu().numpy()
@@ -691,16 +742,16 @@ class DreamerV3:
             else:
                 obs_encoded = self.world_model.obs_encoder(obs)
 
-            h = self.h  # [1, 1, HIDDEN_DIM]
+            h = self.h  # [1, 1, hidden_dim]
 
             # Compute posterior over latent variables
             posterior_input = torch.cat([h.squeeze(0), obs_encoded], dim=-1)
             posterior_logits = self.world_model.posterior_net(posterior_input)
             posterior_logits = posterior_logits.view(
-                1, LATENT_DIM, LATENT_CATEGORIES
+                1, self.config.latent_dim, self.config.latent_categories
             )
             posterior_sample = gumbel_softmax(posterior_logits, hard=True).view(1, -1)
-            imag_s = posterior_sample  # [1, LATENT_DIM * LATENT_CATEGORIES]
+            imag_s = posterior_sample  # [1, latent_dim * latent_categories]
 
             # Get action probabilities from actor
             action_probs = self.actor(h.squeeze(0))
@@ -729,8 +780,8 @@ class DreamerV3:
 
 
 # Training Loop
-def train_dreamer(args):
-    env = gym.make(args.env)
+def train_dreamer(config):
+    env = gym.make(config.env)
     # Determine if the observation space is image-based or vector-based
     obs_space = env.observation_space
     if isinstance(obs_space, gym.spaces.Box) and len(obs_space.shape) == 3:
@@ -739,31 +790,28 @@ def train_dreamer(args):
         is_image = False
 
     if is_image:
-        # Preprocess observations to shape (4, 84, 84)
+        # Preprocess observations to shape (3, 64, 64)
         transform = transforms.Compose(
             [
-                transforms.Resize((84, 84)),
-                transforms.Grayscale(num_output_channels=1),
+                transforms.Resize((64, 64)),
             ]
         )
-        obs_shape = (4, 84, 84)
+        obs_shape = (3, 64, 64)
     else:
         obs_shape = obs_space.shape
         transform = None
 
     act_dim = env.action_space.n
 
-    agent = DreamerV3(obs_shape, act_dim, is_image)
+    agent = DreamerV3(obs_shape, act_dim, is_image, config)
     total_rewards = []
 
     frame_idx = 0  # For beta annealing
 
-    for episode in range(args.episodes):
+    for episode in range(config.episodes):
         obs, _ = env.reset()
         if is_image:
             obs = transform(torch.tensor(obs).permute(2, 0, 1)).numpy()
-            obs = np.repeat(obs, 4, axis=0)  # Stack 4 frames
-            frame_stack = deque([obs.copy() for _ in range(4)], maxlen=4)
         else:
             obs = obs.astype(np.float32)
         done = False
@@ -779,10 +827,8 @@ def train_dreamer(args):
                 next_obs_processed = transform(
                     torch.tensor(next_obs).permute(2, 0, 1)
                 ).numpy()
-                frame_stack.append(next_obs_processed)
-                next_obs = np.concatenate(frame_stack, axis=0)  # Update frame stack
-                agent.store_transition(obs, action, reward, next_obs, done)
-                obs = next_obs
+                agent.store_transition(obs, action, reward, next_obs_processed, done)
+                obs = next_obs_processed
             else:
                 next_obs = next_obs.astype(np.float32)
                 agent.store_transition(obs, action, reward, next_obs, done)
@@ -792,11 +838,13 @@ def train_dreamer(args):
 
             frame_idx += 1
             agent.beta = min(
-                1.0, BETA_START + frame_idx * (1.0 - BETA_START) / BETA_FRAMES
+                1.0, config.beta_start + frame_idx * (1.0 - config.beta_start) / config.beta_frames
             )
 
-            if len(agent.replay_buffer.tree.data) >= BATCH_SIZE * SEQ_LEN:
-                agent.train(num_updates=1)
+            if len(agent.replay_buffer) >= config.batch_size * config.seq_len:
+                print(f"About to train for {config.num_updates} updates")
+                agent.train(num_updates=config.num_updates)
+                print("Got here...")
 
             if done:
                 total_rewards.append(episode_reward)
@@ -808,9 +856,30 @@ def train_dreamer(args):
 
 if __name__ == "__main__":
     import argparse
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", type=str, default="CartPole-v1")
-    parser.add_argument("--episodes", type=int, default=1000)
+    parser.add_argument("--episodes", type=int, default=10000)
+    parser.add_argument("--latent_dim", type=int, default=32)
+    parser.add_argument("--latent_categories", type=int, default=32)
+    parser.add_argument("--hidden_dim", type=int, default=4096)
+    parser.add_argument("--actor_lr", type=float, default=3e-4)
+    parser.add_argument("--critic_lr", type=float, default=3e-4)
+    parser.add_argument("--world_lr", type=float, default=1e-3)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--imagination_horizon", type=int, default=15)
+    parser.add_argument("--free_nats", type=float, default=0.3)
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--seq_len", type=int, default=64)
+    parser.add_argument("--replay_buffer_capacity", type=int, default=100000)
+    parser.add_argument("--entropy_scale", type=float, default=0.001)
+    parser.add_argument("--kl_balance_alpha", type=float, default=0.8)
+    parser.add_argument("--alpha", type=float, default=0.6)
+    parser.add_argument("--beta_start", type=float, default=0.4)
+    parser.add_argument("--beta_frames", type=int, default=100000)
+    parser.add_argument("--lambda_", type=float, default=0.95, help="Lambda for lambda returns")
+    parser.add_argument("--max_grad_norm", type=float, default=1000)
+    parser.add_argument("--weight_decay", type=float, default=1e-6)
+    parser.add_argument("--num_updates", type=int, default=5)
     args = parser.parse_args()
+
     train_dreamer(args)
