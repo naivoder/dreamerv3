@@ -303,19 +303,24 @@ class WorldModel(nn.Module):
         prior_dist = torch.distributions.Categorical(logits=prior_logits)
         posterior_dist = torch.distributions.Categorical(logits=posterior_logits)
 
-        kl_div_forward = torch.distributions.kl_divergence(
-            posterior_dist, prior_dist
-        ).sum(-1)
-        kl_div_reverse = torch.distributions.kl_divergence(
-            prior_dist, posterior_dist
-        ).sum(-1)
+        # Compute KL divergence per latent dimension and time step
+        kl_div_forward = torch.distributions.kl_divergence(posterior_dist, prior_dist)
+        # kl_div_forward shape: [batch_size, seq_len - 1, latent_dim]
+
+        # Sum over latent dimensions (latent_dim)
+        kl_div_forward = kl_div_forward.sum(dim=2)  # Shape: [batch_size, seq_len - 1]
+
+        kl_div_reverse = torch.distributions.kl_divergence(prior_dist, posterior_dist)
+        kl_div_reverse = kl_div_reverse.sum(dim=2)  # Shape: [batch_size, seq_len - 1]
 
         kl_loss = (
             self.kl_balance_alpha * kl_div_forward
             + (1 - self.kl_balance_alpha) * kl_div_reverse
         )
-        kl_loss = torch.clamp(kl_loss, min=self.free_nats).mean(dim=[1, 2])  # Mean over time and latent dims
+        kl_loss = torch.clamp(kl_loss - self.free_nats, min=0.0).mean(dim=1)  # Mean over time steps
         return kl_loss  # Shape: [batch_size]
+
+
 
 
 # Actor Network for Discrete Actions with Temperature Scaling
@@ -492,7 +497,7 @@ class DreamerV3:
             imag_h, _ = self.world_model.rnn(
                 rnn_input.unsqueeze(1), imag_h.unsqueeze(0)
             )
-            imag_h = imag_h.squeeze(0)
+            imag_h = imag_h.squeeze(1)
 
             # Predict reward
             decoder_input = torch.cat([imag_h, imag_s], dim=-1)
@@ -540,7 +545,7 @@ class DreamerV3:
         critic_loss = F.mse_loss(values, returns_flat.detach())
 
         self.critic_optimizer.zero_grad()
-        critic_loss.backward()
+        critic_loss.backward(retain_graph=True)
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.config.max_grad_norm)
         self.critic_optimizer.step()
 
