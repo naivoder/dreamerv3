@@ -33,49 +33,119 @@ def gumbel_softmax(logits, tau=1.0, hard=False):
     else:
         return y_soft
 
-
-class ReplayBuffer:
+# SumTree data structure for efficient sampling
+class SumTree:
     def __init__(self, capacity):
         self.capacity = capacity
-        self.buffer = []
-        self.position = 0  # Points to the next index to write data
+        self.tree = np.zeros(2 * capacity - 1)  # Binary tree structure
+        self.data = [None] * capacity  # Stores actual transitions
+        self.write = 0  # Points to the next index to write data
 
-    def __len__(self):
-        return len(self.buffer)
+    def _propagate(self, idx, change):
+        parent = (idx - 1) // 2
+
+        self.tree[parent] += change
+
+        if parent != 0:
+            self._propagate(parent, change)
+
+    def _retrieve(self, idx, s):
+        left = 2 * idx + 1
+        right = left + 1
+
+        if left >= len(self.tree):
+            return idx
+
+        if s <= self.tree[left]:
+            return self._retrieve(left, s)
+        else:
+            return self._retrieve(right, s - self.tree[left])
+
+    def total(self):
+        return self.tree[0]
+
+    def add(self, priority, data):
+        idx = self.write + self.capacity - 1
+
+        self.data[self.write] = data  # Store data in self.data
+        self.update(idx, priority)
+
+        self.write += 1
+        if self.write >= self.capacity:
+            self.write = 0  # Overwrite if capacity exceeded
+
+    def update(self, idx, priority):
+        change = priority - self.tree[idx]
+
+        self.tree[idx] = priority
+        self._propagate(idx, change)
+
+    def get(self, s):
+        idx = self._retrieve(0, s)
+        data_idx = idx - self.capacity + 1
+
+        return idx, self.tree[idx], self.data[data_idx]
+
+
+# Prioritized Replay Buffer with SumTree
+class ReplayBuffer:
+    def __init__(self, capacity, alpha=0.6):
+        """
+        capacity: maximum size of the buffer
+        alpha: how much prioritization is used (0 - no prioritization, 1 - full prioritization)
+        """
+        self.capacity = capacity
+        self.tree = SumTree(capacity)
+        self.alpha = alpha
+        self.epsilon = 1e-6  # Small amount to avoid zero priority
 
     def store(self, transition):
-        if len(self.buffer) < self.capacity:
-            self.buffer.append(None)
-        self.buffer[self.position] = transition
-        self.position = (self.position + 1) % self.capacity
+        # Assign maximum priority to new transitions to ensure they are sampled at least once
+        max_priority = np.max(self.tree.tree[-self.tree.capacity:])
+        if max_priority == 0:
+            max_priority = 1.0
+        self.tree.add(max_priority, transition)
 
-    def sample_batch(self, batch_size, seq_len):
-        if len(self.buffer) < seq_len:
-            raise ValueError(f"Not enough elements in buffer to sample sequences of length {seq_len}")
-
+    def sample_batch(self, batch_size, seq_len, beta=0.4):
+        """
+        batch_size: number of samples to draw
+        seq_len: length of each sequence
+        beta: controls how much importance sampling is used (0 - no corrections, 1 - full correction)
+        """
         batch = []
         idxs = []
+        segment = self.tree.total() / batch_size
         priorities = []
 
-        for _ in range(batch_size):
-            valid = False
-            max_attempts = 1000
-            attempts = 0
-            while not valid and attempts < max_attempts:
-                # Randomly sample a starting index
-                idx = random.randint(0, len(self.buffer) - seq_len)
-                seq = self.buffer[idx:idx + seq_len]
-                if len(seq) == seq_len and None not in seq:
-                    valid = True
-                attempts += 1
-            if not valid:
-                raise ValueError(f"Failed to sample a valid sequence after {max_attempts} attempts")
+        for i in range(batch_size):
+            s = random.uniform(segment * i, segment * (i + 1))
+            idx, priority, data = self.tree.get(s)
+
+            # Collect sequences
+            seq = []
+            for offset in range(seq_len):
+                idx_offset = idx + offset
+                if idx_offset >= self.tree.capacity * 2 - 1:
+                    break
+                data_idx = idx_offset - self.tree.capacity + 1
+                if data_idx >= self.capacity:
+                    data_idx -= self.capacity
+                seq_data = self.tree.data[data_idx]
+                if seq_data is None:
+                    break
+                seq.append(seq_data)
+            if len(seq) < seq_len:
+                continue  # Skip if not enough sequence data
             batch.append(seq)
             idxs.append(idx)
-            priorities.append(1.0)  # All priorities are equal
+            priorities.append(priority)
 
-        # Importance sampling weights are all ones in FIFO buffer
-        is_weights = np.ones(batch_size, dtype=np.float32)
+        if len(batch) == 0:
+            return [None] * 7  # Not enough data
+
+        sampling_probabilities = np.array(priorities) / self.tree.total()
+        is_weights = np.power(self.tree.capacity * sampling_probabilities, -beta)
+        is_weights /= is_weights.max()  # Normalize for stability
 
         # Unpack batch data
         obs_batch, act_batch, rew_batch, next_obs_batch, done_batch = [], [], [], [], []
@@ -87,9 +157,6 @@ class ReplayBuffer:
             next_obs_batch.append(np.array(next_obs_seq))
             done_batch.append(np.array(done_seq))
 
-        # Set device to CPU or GPU
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
         return (
             torch.tensor(np.array(obs_batch), dtype=torch.float32).to(device),
             torch.tensor(np.array(act_batch), dtype=torch.long).to(device),
@@ -100,6 +167,11 @@ class ReplayBuffer:
             torch.tensor(is_weights, dtype=torch.float32).to(device),
         )
 
+    def update_priorities(self, idxs, priorities):
+        # Priorities should be positive
+        priorities += self.epsilon
+        for idx, priority in zip(idxs, priorities):
+            self.tree.update(idx, priority ** self.alpha)
 
 
 # Convolutional Encoder for Image Observations
@@ -414,7 +486,7 @@ class DreamerV3:
             self.critic.parameters(), lr=config.critic_lr, weight_decay=config.weight_decay
         )
 
-        self.replay_buffer = ReplayBuffer(config.replay_buffer_capacity)
+        self.replay_buffer = ReplayBuffer(config.replay_buffer_capacity, alpha=config.alpha)
 
         # Hidden states
         self.h = None
@@ -438,12 +510,10 @@ class DreamerV3:
 
     def update_world_model(self):
         batch = self.replay_buffer.sample_batch(
-            self.config.batch_size, self.config.seq_len
+            self.config.batch_size, self.config.seq_len, beta=self.beta
         )
         if batch[0] is None:
-            print("No batch 🤷‍♀️")
             return  # Not enough data to train
-        
 
         obs_seq, act_seq, rew_seq, next_obs_seq, done_seq, idxs, is_weights = batch
         act_seq = act_seq  # [batch_size, seq_len]
@@ -482,13 +552,12 @@ class DreamerV3:
 
         # Update priorities
         priorities = loss_world.detach().cpu().numpy()
-        # self.replay_buffer.update_priorities(idxs, priorities)
+        self.replay_buffer.update_priorities(idxs, priorities)
 
     def update_actor_and_critic(self):
         # Imagined rollouts
-        batch = self.replay_buffer.sample_batch(self.config.batch_size, 1)
+        batch = self.replay_buffer.sample_batch(self.config.batch_size, 1, beta=self.beta)
         if batch[0] is None:
-            print("No data 🤷‍♀️")
             return  # Not enough data to train
 
         obs_seq, act_seq, _, _, _, idxs, is_weights = batch
@@ -629,7 +698,7 @@ class DreamerV3:
                 dim=0
             )
             priorities = td_errors_batch.abs().cpu().numpy()
-            # self.replay_buffer.update_priorities(idxs, priorities)
+            self.replay_buffer.update_priorities(idxs, priorities)
 
         # Update target critic
         self._soft_update(self.target_critic, self.critic)
@@ -768,7 +837,7 @@ def train_dreamer(config):
                 1.0, config.beta_start + frame_idx * (1.0 - config.beta_start) / config.beta_frames
             )
 
-            if len(agent.replay_buffer) >= config.batch_size * config.seq_len:
+            if frame_idx >= config.batch_size * config.seq_len:
                 agent.train(num_updates=config.num_updates)
 
             if done:
@@ -787,8 +856,8 @@ if __name__ == "__main__":
     parser.add_argument("--latent_dim", type=int, default=32)
     parser.add_argument("--latent_categories", type=int, default=32)
     parser.add_argument("--hidden_dim", type=int, default=4096)
-    parser.add_argument("--actor_lr", type=float, default=1e-3)
-    parser.add_argument("--critic_lr", type=float, default=1e-3)
+    parser.add_argument("--actor_lr", type=float, default=3e-4)
+    parser.add_argument("--critic_lr", type=float, default=3e-4)
     parser.add_argument("--world_lr", type=float, default=1e-3)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--imagination_horizon", type=int, default=15)
@@ -800,12 +869,11 @@ if __name__ == "__main__":
     parser.add_argument("--kl_balance_alpha", type=float, default=0.8)
     parser.add_argument("--alpha", type=float, default=0.6)
     parser.add_argument("--beta_start", type=float, default=0.4)
-    parser.add_argument("--beta_frames", type=int, default=10000)
-    parser.add_argument("--lambda_", type=float, default=0.95)
-    parser.add_argument("--max_grad_norm", type=float, default=1)
+    parser.add_argument("--beta_frames", type=int, default=100000)
+    parser.add_argument("--lambda_", type=float, default=0.95, help="Lambda for lambda returns")
+    parser.add_argument("--max_grad_norm", type=float, default=1000)
     parser.add_argument("--weight_decay", type=float, default=1e-6)
-    parser.add_argument("--num_updates", type=int, default=5)
-
+    parser.add_argument("--num_updates", type=int, default=1)
     args = parser.parse_args()
 
     train_dreamer(args)
