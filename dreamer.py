@@ -8,6 +8,7 @@ import random
 from torchvision import transforms
 from collections import deque
 import itertools
+from tqdm import tqdm
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -629,15 +630,13 @@ class DreamerV3:
             self.temperature = max(self.temperature * self.config.temperature_decay, self.config.min_temperature)
 
 
-# Training Loop
+from tqdm import tqdm
+
 def train_dreamer(config):
     env = gym.make(config.env)
     # Determine if the observation space is image-based or vector-based
     obs_space = env.observation_space
-    if isinstance(obs_space, gym.spaces.Box) and len(obs_space.shape) == 3:
-        is_image = True
-    else:
-        is_image = False
+    is_image = isinstance(obs_space, gym.spaces.Box) and len(obs_space.shape) == 3
 
     if is_image:
         # Preprocess observations to shape (3, 64, 64)
@@ -654,50 +653,58 @@ def train_dreamer(config):
         transform = None
 
     act_dim = env.action_space.n
-
     agent = DreamerV3(obs_shape, act_dim, is_image, config)
     total_rewards = []
 
     frame_idx = 0  # For temperature annealing
+    avg_reward_window = 100  # Running average over the last 100 episodes
 
-    for episode in range(config.episodes):
-        obs, _ = env.reset()
-        if is_image:
-            obs = transform(obs).numpy()
-        else:
-            obs = obs.astype(np.float32)
-        done = False
-        episode_reward = 0
-        agent.act(obs, reset=True)  # Reset hidden states at episode start
-
-        while not done:
-            action = agent.act(obs)
-            next_obs, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
-
+    with tqdm(total=config.episodes, desc="Training Progress", unit="episode") as pbar:
+        for episode in range(config.episodes):
+            obs, _ = env.reset()
             if is_image:
-                next_obs_processed = transform(next_obs).numpy()
-                agent.store_transition(obs, action, reward, next_obs_processed, done)
-                obs = next_obs_processed
+                obs = transform(obs).numpy()
             else:
-                next_obs = next_obs.astype(np.float32)
-                agent.store_transition(obs, action, reward, next_obs, done)
-                obs = next_obs
+                obs = obs.astype(np.float32)
+            done = False
+            episode_reward = 0
+            agent.act(obs, reset=True)  # Reset hidden states at episode start
 
-            episode_reward += reward
+            while not done:
+                action = agent.act(obs)
+                next_obs, reward, terminated, truncated, _ = env.step(action)
+                done = terminated or truncated
 
-            frame_idx += 1
+                if is_image:
+                    next_obs_processed = transform(next_obs).numpy()
+                    agent.store_transition(obs, action, reward, next_obs_processed, done)
+                    obs = next_obs_processed
+                else:
+                    next_obs = next_obs.astype(np.float32)
+                    agent.store_transition(obs, action, reward, next_obs, done)
+                    obs = next_obs
 
-            if len(agent.replay_buffer) > config.min_buffer_size:
-                if frame_idx % config.train_horizon == 0:
-                    agent.train(num_updates=config.num_updates)
+                episode_reward += reward
+                frame_idx += 1
 
-            if done:
-                total_rewards.append(episode_reward)
-                print(f"Episode {episode} Reward: {episode_reward}")
-                break  # Exit the while loop when the episode is done
+                if len(agent.replay_buffer) > config.min_buffer_size:
+                    if frame_idx % config.train_horizon == 0:
+                        agent.train(num_updates=config.num_updates)
+
+                if done:
+                    total_rewards.append(episode_reward)
+                    # Update the progress bar with running average reward
+                    if len(total_rewards) >= avg_reward_window:
+                        running_avg_reward = sum(total_rewards[-avg_reward_window:]) / avg_reward_window
+                    else:
+                        running_avg_reward = sum(total_rewards) / len(total_rewards)
+                    
+                    pbar.set_postfix({"Running Avg. Reward": f"{running_avg_reward:.2f}"})
+                    pbar.update(1)  # Update the progress bar for one episode completion
+                    break
 
     return total_rewards
+
 
 
 if __name__ == "__main__":
