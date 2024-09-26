@@ -594,7 +594,7 @@ class DreamerV3:
 
 
 # Training Loop
-def train_dreamer(env_name="ALE/Pong-v5", episodes=1000):
+def train_dreamer(env_name="MsPacmanNoFrameskip-v4", episodes=1000):
     env = gym.make(env_name)
     # Preprocess observations to shape (4, 84, 84)
     transform = transforms.Compose(
@@ -604,7 +604,7 @@ def train_dreamer(env_name="ALE/Pong-v5", episodes=1000):
         ]
     )
 
-    obs_shape = (1, 84, 84)
+    obs_shape = (4, 84, 84)
     act_dim = env.action_space.n
 
     agent = DreamerV3(obs_shape, act_dim)
@@ -615,6 +615,7 @@ def train_dreamer(env_name="ALE/Pong-v5", episodes=1000):
     for episode in range(episodes):
         obs, _ = env.reset()
         obs = transform(torch.tensor(obs).permute(2, 0, 1)).numpy()
+        obs = np.repeat(obs, 4, axis=0)  # Stack 4 frames
         done = False
         episode_reward = 0
         agent.act(obs, reset=True)  # Reset hidden states at episode start
@@ -640,7 +641,7 @@ def train_dreamer(env_name="ALE/Pong-v5", episodes=1000):
             )
 
             if len(agent.replay_buffer.tree.data) >= BATCH_SIZE * SEQ_LEN:
-                agent.train(num_updates=1)
+                agent.train(num_updates=3)
 
             if done:
                 total_rewards.append(episode_reward)
