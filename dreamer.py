@@ -5,6 +5,7 @@ import torch.optim as optim
 import numpy as np
 import random
 from torchvision import transforms
+from collections import deque
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -119,7 +120,7 @@ class ReplayBuffer:
 
     def store(self, transition):
         # Assign maximum priority to new transitions to ensure they are sampled at least once
-        max_priority = np.max(self.tree.tree[-self.tree.capacity :])
+        max_priority = np.max(self.tree.tree[-self.tree.capacity:])
         if max_priority == 0:
             max_priority = 1.0
         self.tree.add(max_priority, transition)
@@ -215,7 +216,7 @@ class ConvEncoder(nn.Module):
         return self.conv_net(obs)
 
 
-# Convolutional Decoder for Reconstructing Observations
+# Convolutional Decoder for Reconstructing Image Observations
 class ConvDecoder(nn.Module):
     def __init__(self, obs_shape):
         super(ConvDecoder, self).__init__()
@@ -240,26 +241,71 @@ class ConvDecoder(nn.Module):
         return self.deconv_net(x)
 
 
+# MLP Encoder for Vector Observations
+class MLPEncoder(nn.Module):
+    def __init__(self, obs_dim):
+        super(MLPEncoder, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Linear(HIDDEN_DIM, HIDDEN_DIM),
+            nn.ReLU(),
+        )
+
+    def forward(self, obs):
+        return self.net(obs)
+
+
+# MLP Decoder for Reconstructing Vector Observations
+class MLPDecoder(nn.Module):
+    def __init__(self, obs_dim):
+        super(MLPDecoder, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(HIDDEN_DIM + LATENT_DIM * LATENT_CATEGORIES, HIDDEN_DIM),
+            nn.ReLU(),
+            nn.Linear(HIDDEN_DIM, obs_dim),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
 # World Model with Discrete Latent Representations and KL Balancing
 class WorldModel(nn.Module):
-    def __init__(self, obs_shape, act_dim):
+    def __init__(self, obs_shape, act_dim, is_image):
         super(WorldModel, self).__init__()
-        self.obs_encoder = ConvEncoder(obs_shape)
-        self.obs_shape = obs_shape
+        self.is_image = is_image
         self.act_dim = act_dim
 
+        if self.is_image:
+            self.obs_encoder = ConvEncoder(obs_shape)
+            self.obs_decoder = ConvDecoder(obs_shape)
+            self.obs_shape = obs_shape
+            self.obs_dim = None
+        else:
+            self.obs_dim = obs_shape[0]
+            self.obs_encoder = MLPEncoder(self.obs_dim)
+            self.obs_decoder = MLPDecoder(self.obs_dim)
+            self.obs_shape = (self.obs_dim,)
         self.rnn = nn.GRU(HIDDEN_DIM + act_dim, HIDDEN_DIM, batch_first=True)
         self.prior_net = nn.Linear(HIDDEN_DIM, LATENT_DIM * LATENT_CATEGORIES)
         self.posterior_net = nn.Linear(
             HIDDEN_DIM + HIDDEN_DIM, LATENT_DIM * LATENT_CATEGORIES
         )
-        self.obs_decoder = ConvDecoder(obs_shape)
         self.reward_decoder = nn.Linear(HIDDEN_DIM + LATENT_DIM * LATENT_CATEGORIES, 1)
 
     def forward(self, obs_seq, act_seq, h=None):
-        batch_size, seq_len, c, h_obs, w_obs = obs_seq.size()
-        obs_seq = obs_seq.view(batch_size * seq_len, c, h_obs, w_obs)
-        obs_encoded = self.obs_encoder(obs_seq)
+        batch_size, seq_len = obs_seq.size(0), obs_seq.size(1)
+
+        if self.is_image:
+            obs_seq = obs_seq.view(
+                batch_size * seq_len, *self.obs_shape
+            )  # [batch_size * seq_len, c, h, w]
+            obs_encoded = self.obs_encoder(obs_seq)
+        else:
+            obs_seq = obs_seq.view(batch_size * seq_len, -1)  # [batch_size * seq_len, obs_dim]
+            obs_encoded = self.obs_encoder(obs_seq)
+
         obs_encoded = obs_encoded.view(batch_size, seq_len, -1)
 
         act_seq_onehot = torch.nn.functional.one_hot(
@@ -292,8 +338,12 @@ class WorldModel(nn.Module):
 
         # Decode observation and reward
         decoder_input = torch.cat([rnn_output, posterior_sample], dim=-1)
-        recon_obs = self.obs_decoder(decoder_input.view(-1, decoder_input.size(-1)))
-        recon_obs = recon_obs.view(batch_size, seq_len - 1, *self.obs_shape)
+        if self.is_image:
+            recon_obs = self.obs_decoder(decoder_input.view(-1, decoder_input.size(-1)))
+            recon_obs = recon_obs.view(batch_size, seq_len - 1, *self.obs_shape)
+        else:
+            recon_obs = self.obs_decoder(decoder_input.view(-1, decoder_input.size(-1)))
+            recon_obs = recon_obs.view(batch_size, seq_len - 1, *self.obs_shape)
         pred_reward = self.reward_decoder(decoder_input)
 
         outputs = {
@@ -366,11 +416,12 @@ class Critic(nn.Module):
 
 # DreamerV3 Agent
 class DreamerV3:
-    def __init__(self, obs_shape, act_dim):
+    def __init__(self, obs_shape, act_dim, is_image):
         self.obs_shape = obs_shape
         self.act_dim = act_dim
+        self.is_image = is_image
 
-        self.world_model = WorldModel(obs_shape, act_dim).to(device)
+        self.world_model = WorldModel(obs_shape, act_dim, is_image).to(device)
         self.actor = Actor(HIDDEN_DIM, act_dim).to(device)
         self.critic = Critic(HIDDEN_DIM).to(device)
         self.target_critic = Critic(HIDDEN_DIM).to(device)
@@ -396,7 +447,6 @@ class DreamerV3:
             return  # Not enough data to train
 
         obs_seq, act_seq, rew_seq, next_obs_seq, done_seq, idxs, is_weights = batch
-        obs_seq = obs_seq  # [batch_size, seq_len, c, h, w]
         act_seq = act_seq  # [batch_size, seq_len]
         rew_seq = rew_seq  # [batch_size, seq_len]
         is_weights = is_weights.unsqueeze(1)  # [batch_size, 1]
@@ -407,8 +457,12 @@ class DreamerV3:
         kl_loss = outputs["kl_loss"]
 
         # Reconstruction loss
-        recon_loss = nn.MSELoss(reduction="none")(recon_obs, obs_seq[:, 1:])
-        recon_loss = recon_loss.mean(dim=[1, 2, 3, 4])  # [batch_size]
+        if self.is_image:
+            recon_loss = nn.MSELoss(reduction="none")(recon_obs, obs_seq[:, 1:])
+            recon_loss = recon_loss.mean(dim=[1, 2, 3, 4])  # [batch_size]
+        else:
+            recon_loss = nn.MSELoss(reduction="none")(recon_obs, obs_seq[:, 1:])
+            recon_loss = recon_loss.mean(dim=[1, 2])  # [batch_size]
 
         # Reward prediction loss
         reward_loss = nn.MSELoss(reduction="none")(pred_reward, symlog(rew_seq[:, 1:]))
@@ -440,7 +494,11 @@ class DreamerV3:
         is_weights = is_weights  # [batch_size]
 
         h = torch.zeros(1, BATCH_SIZE, HIDDEN_DIM, device=device)
-        obs_encoded = self.world_model.obs_encoder(obs)
+        if self.is_image:
+            obs_encoded = self.world_model.obs_encoder(obs)
+        else:
+            obs_encoded = self.world_model.obs_encoder(obs)
+
         h = h.permute(1, 0, 2)  # [batch_size, HIDDEN_DIM]
         h = h[:, -1]  # [batch_size, HIDDEN_DIM]
 
@@ -566,9 +624,13 @@ class DreamerV3:
             self.reset_hidden_states()
 
         obs = torch.tensor(obs).float().to(device).unsqueeze(0)
-        obs = obs / 255.0  # Normalize pixel values
+
         with torch.no_grad():
-            obs_encoded = self.world_model.obs_encoder(obs)
+            if self.is_image:
+                obs_encoded = self.world_model.obs_encoder(obs / 255.0)
+            else:
+                obs_encoded = self.world_model.obs_encoder(obs)
+
             action_probs = self.actor(self.h[-1])
             action_dist = torch.distributions.Categorical(probs=action_probs)
             action = action_dist.sample().cpu().numpy()[0]
@@ -596,26 +658,41 @@ class DreamerV3:
 # Training Loop
 def train_dreamer(args):
     env = gym.make(args.env)
-    # Preprocess observations to shape (4, 84, 84)
-    transform = transforms.Compose(
-        [
-            transforms.Resize((84, 84)),
-            transforms.Grayscale(num_output_channels=1),
-        ]
-    )
+    # Determine if the observation space is image-based or vector-based
+    obs_space = env.observation_space
+    if isinstance(obs_space, gym.spaces.Box) and len(obs_space.shape) == 3:
+        is_image = True
+    else:
+        is_image = False
 
-    obs_shape = (4, 84, 84)
+    if is_image:
+        # Preprocess observations to shape (4, 84, 84)
+        transform = transforms.Compose(
+            [
+                transforms.Resize((84, 84)),
+                transforms.Grayscale(num_output_channels=1),
+            ]
+        )
+        obs_shape = (4, 84, 84)
+    else:
+        obs_shape = obs_space.shape
+        transform = None
+
     act_dim = env.action_space.n
 
-    agent = DreamerV3(obs_shape, act_dim)
+    agent = DreamerV3(obs_shape, act_dim, is_image)
     total_rewards = []
 
     frame_idx = 0  # For beta annealing
 
     for episode in range(args.episodes):
         obs, _ = env.reset()
-        obs = transform(torch.tensor(obs).permute(2, 0, 1)).numpy()
-        obs = np.repeat(obs, 4, axis=0)  # Stack 4 frames
+        if is_image:
+            obs = transform(torch.tensor(obs).permute(2, 0, 1)).numpy()
+            obs = np.repeat(obs, 4, axis=0)  # Stack 4 frames
+            frame_stack = deque([obs.copy() for _ in range(4)], maxlen=4)
+        else:
+            obs = obs.astype(np.float32)
         done = False
         episode_reward = 0
         agent.act(obs, reset=True)  # Reset hidden states at episode start
@@ -624,15 +701,20 @@ def train_dreamer(args):
             action = agent.act(obs)
             next_obs, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
-            next_obs_processed = transform(
-                torch.tensor(next_obs).permute(2, 0, 1)
-            ).numpy()
-            next_obs = np.concatenate(
-                (obs[1:], next_obs_processed), axis=0
-            )  # Update frame stack
 
-            agent.store_transition(obs, action, reward, next_obs, done)
-            obs = next_obs
+            if is_image:
+                next_obs_processed = transform(
+                    torch.tensor(next_obs).permute(2, 0, 1)
+                ).numpy()
+                frame_stack.append(next_obs_processed)
+                next_obs = np.concatenate(frame_stack, axis=0)  # Update frame stack
+                agent.store_transition(obs, action, reward, next_obs, done)
+                obs = next_obs
+            else:
+                next_obs = next_obs.astype(np.float32)
+                agent.store_transition(obs, action, reward, next_obs, done)
+                obs = next_obs
+
             episode_reward += reward
 
             frame_idx += 1
@@ -650,11 +732,12 @@ def train_dreamer(args):
 
     return total_rewards
 
+
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--env", type=str, default="MsPacmanNoFrameskip-v4")
+    parser.add_argument("--env", type=str, default="CartPole-v1")
     parser.add_argument("--episodes", type=int, default=1000)
     args = parser.parse_args()
     train_dreamer(args)
