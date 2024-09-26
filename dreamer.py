@@ -594,8 +594,8 @@ class DreamerV3:
 
 
 # Training Loop
-def train_dreamer(env_name="MsPacmanNoFrameskip-v4", episodes=1000):
-    env = gym.make(env_name)
+def train_dreamer(args):
+    env = gym.make(args.env)
     # Preprocess observations to shape (4, 84, 84)
     transform = transforms.Compose(
         [
@@ -612,7 +612,7 @@ def train_dreamer(env_name="MsPacmanNoFrameskip-v4", episodes=1000):
 
     frame_idx = 0  # For beta annealing
 
-    for episode in range(episodes):
+    for episode in range(args.episodes):
         obs, _ = env.reset()
         obs = transform(torch.tensor(obs).permute(2, 0, 1)).numpy()
         obs = np.repeat(obs, 4, axis=0)  # Stack 4 frames
@@ -641,7 +641,7 @@ def train_dreamer(env_name="MsPacmanNoFrameskip-v4", episodes=1000):
             )
 
             if len(agent.replay_buffer.tree.data) >= BATCH_SIZE * SEQ_LEN:
-                agent.train(num_updates=3)
+                agent.train(num_updates=1)
 
             if done:
                 total_rewards.append(episode_reward)
@@ -650,6 +650,11 @@ def train_dreamer(env_name="MsPacmanNoFrameskip-v4", episodes=1000):
 
     return total_rewards
 
-
 if __name__ == "__main__":
-    train_dreamer()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--env", type=str, default="MsPacmanNoFrameskip-v4")
+    parser.add_argument("--episodes", type=int, default=1000)
+    args = parser.parse_args()
+    train_dreamer(args)
