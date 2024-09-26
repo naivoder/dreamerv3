@@ -13,16 +13,16 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 LATENT_DIM = 32  # Number of discrete latent variables
 LATENT_CATEGORIES = 32  # Number of categories for each variable
 HIDDEN_DIM = 256
-ACTOR_LR = 3e-4
-CRITIC_LR = 3e-4
-WORLD_LR = 1e-4
+ACTOR_LR = 1e-3  # Increased learning rates for better learning
+CRITIC_LR = 1e-3
+WORLD_LR = 1e-3
 GAMMA = 0.99
 IMAGINATION_HORIZON = 15
-FREE_NATS = 3.0  # For KL balancing
-BATCH_SIZE = 32
+FREE_NATS = 0.1  # Reduced to make KL loss more influential
+BATCH_SIZE = 64  # Increased batch size
 SEQ_LEN = 50
 REPLAY_BUFFER_CAPACITY = 100000
-ENTROPY_SCALE = 1e-2  # For entropy regularization
+ENTROPY_SCALE = 0.1  # Increased to encourage exploration
 KL_BALANCE_ALPHA = 0.8  # For KL balancing between forward and reverse KL
 ALPHA = 0.6  # Prioritization exponent
 BETA_START = 0.4  # Initial beta value for importance sampling
@@ -190,7 +190,7 @@ class ReplayBuffer:
         # Priorities should be positive
         priorities += self.epsilon
         for idx, priority in zip(idxs, priorities):
-            self.tree.update(idx, priority**self.alpha)
+            self.tree.update(idx, priority ** self.alpha)
 
 
 # Convolutional Encoder for Image Observations
@@ -287,14 +287,16 @@ class WorldModel(nn.Module):
             self.obs_encoder = MLPEncoder(self.obs_dim)
             self.obs_decoder = MLPDecoder(self.obs_dim)
             self.obs_shape = (self.obs_dim,)
-        self.rnn = nn.GRU(HIDDEN_DIM + act_dim, HIDDEN_DIM, batch_first=True)
+        self.rnn = nn.GRU(
+            LATENT_DIM * LATENT_CATEGORIES + act_dim, HIDDEN_DIM, batch_first=True
+        )
         self.prior_net = nn.Linear(HIDDEN_DIM, LATENT_DIM * LATENT_CATEGORIES)
         self.posterior_net = nn.Linear(
             HIDDEN_DIM + HIDDEN_DIM, LATENT_DIM * LATENT_CATEGORIES
         )
         self.reward_decoder = nn.Linear(HIDDEN_DIM + LATENT_DIM * LATENT_CATEGORIES, 1)
 
-    def forward(self, obs_seq, act_seq, h=None):
+    def forward(self, obs_seq, act_seq):
         batch_size, seq_len = obs_seq.size(0), obs_seq.size(1)
 
         if self.is_image:
@@ -303,7 +305,9 @@ class WorldModel(nn.Module):
             )  # [batch_size * seq_len, c, h, w]
             obs_encoded = self.obs_encoder(obs_seq)
         else:
-            obs_seq = obs_seq.view(batch_size * seq_len, -1)  # [batch_size * seq_len, obs_dim]
+            obs_seq = obs_seq.view(
+                batch_size * seq_len, -1
+            )  # [batch_size * seq_len, obs_dim]
             obs_encoded = self.obs_encoder(obs_seq)
 
         obs_encoded = obs_encoded.view(batch_size, seq_len, -1)
@@ -311,33 +315,71 @@ class WorldModel(nn.Module):
         act_seq_onehot = torch.nn.functional.one_hot(
             act_seq, num_classes=self.act_dim
         ).float()
-        rnn_input = torch.cat([obs_encoded[:, :-1], act_seq_onehot[:, :-1]], dim=-1)
-        if h is None:
-            h = torch.zeros(1, batch_size, HIDDEN_DIM, device=obs_seq.device)
-        rnn_output, _ = self.rnn(rnn_input, h)
-        rnn_output = rnn_output  # [batch_size, seq_len - 1, HIDDEN_DIM]
 
-        prior_logits = self.prior_net(rnn_output)
-        posterior_input = torch.cat([rnn_output, obs_encoded[:, 1:]], dim=-1)
+        # Initialize hidden state
+        h = torch.zeros(1, batch_size, HIDDEN_DIM, device=obs_seq.device)
+
+        # Initialize posterior sample
+        posterior_input = torch.cat([h.permute(1, 0, 2), obs_encoded[:, 0:1]], dim=-1)
         posterior_logits = self.posterior_net(posterior_input)
+        posterior_logits = posterior_logits.view(
+            batch_size, LATENT_DIM, LATENT_CATEGORIES
+        )
+        posterior_sample = gumbel_softmax(posterior_logits, hard=True).view(
+            batch_size, 1, -1
+        )
 
+        # Prepare inputs for RNN
+        rnn_inputs = []
+        posterior_samples = [posterior_sample]
+        rnn_hidden_states = []
+
+        for t in range(seq_len - 1):
+            rnn_input = torch.cat(
+                [posterior_samples[-1], act_seq_onehot[:, t : t + 1]], dim=-1
+            )
+            rnn_inputs.append(rnn_input)
+            _, h = self.rnn(rnn_input, h)
+            rnn_hidden_states.append(h.permute(1, 0, 2))
+            posterior_input = torch.cat([h.permute(1, 0, 2), obs_encoded[:, t + 1 : t + 2]], dim=-1)
+            posterior_logits = self.posterior_net(posterior_input)
+            posterior_logits = posterior_logits.view(
+                batch_size, LATENT_DIM, LATENT_CATEGORIES
+            )
+            posterior_sample = gumbel_softmax(posterior_logits, hard=True).view(
+                batch_size, 1, -1
+            )
+            posterior_samples.append(posterior_sample)
+
+        rnn_inputs = torch.cat(rnn_inputs, dim=1)  # [batch_size, seq_len - 1, input_size]
+        rnn_hidden_states = torch.cat(rnn_hidden_states, dim=1)  # [batch_size, seq_len - 1, HIDDEN_DIM]
+        posterior_samples = torch.cat(posterior_samples[:-1], dim=1)
+
+        # Compute prior logits
+        prior_logits = self.prior_net(rnn_hidden_states)
         prior_logits = prior_logits.view(
             batch_size, seq_len - 1, LATENT_DIM, LATENT_CATEGORIES
         )
+
+        # Compute KL divergence with KL balancing
+        posterior_logits = []
+        for t in range(seq_len - 1):
+            posterior_input = torch.cat(
+                [rnn_hidden_states[:, t : t + 1], obs_encoded[:, t + 1 : t + 2]], dim=-1
+            )
+            logits = self.posterior_net(posterior_input)
+            posterior_logits.append(logits)
+        posterior_logits = torch.stack(posterior_logits, dim=1)
         posterior_logits = posterior_logits.view(
             batch_size, seq_len - 1, LATENT_DIM, LATENT_CATEGORIES
         )
 
-        # Sample from posterior
-        posterior_sample = gumbel_softmax(posterior_logits, hard=True).view(
-            batch_size, seq_len - 1, -1
-        )
+        posterior_sample = posterior_samples.view(batch_size, seq_len - 1, -1)
 
-        # Compute KL divergence with KL balancing
         kl_loss = self.compute_kl_loss(prior_logits, posterior_logits)
 
         # Decode observation and reward
-        decoder_input = torch.cat([rnn_output, posterior_sample], dim=-1)
+        decoder_input = torch.cat([rnn_hidden_states, posterior_sample], dim=-1)
         if self.is_image:
             recon_obs = self.obs_decoder(decoder_input.view(-1, decoder_input.size(-1)))
             recon_obs = recon_obs.view(batch_size, seq_len - 1, *self.obs_shape)
@@ -350,7 +392,7 @@ class WorldModel(nn.Module):
             "recon_obs": recon_obs,
             "pred_reward": pred_reward.squeeze(-1),
             "kl_loss": kl_loss,
-            "rnn_h": rnn_output,
+            "rnn_h": rnn_hidden_states,
             "posterior_sample": posterior_sample,
         }
         return outputs
@@ -465,7 +507,9 @@ class DreamerV3:
             recon_loss = recon_loss.mean(dim=[1, 2])  # [batch_size]
 
         # Reward prediction loss
-        reward_loss = nn.MSELoss(reduction="none")(pred_reward, symlog(rew_seq[:, 1:]))
+        reward_loss = nn.MSELoss(reduction="none")(
+            pred_reward, symlog(rew_seq[:, 1:])
+        )
         reward_loss = reward_loss.mean(dim=1)  # [batch_size]
 
         # Total loss
@@ -490,7 +534,6 @@ class DreamerV3:
 
         obs_seq, act_seq, _, _, _, idxs, is_weights = batch
         obs = obs_seq[:, 0]
-        act = act_seq[:, 0]
         is_weights = is_weights  # [batch_size]
 
         h = torch.zeros(1, BATCH_SIZE, HIDDEN_DIM, device=device)
@@ -500,10 +543,21 @@ class DreamerV3:
             obs_encoded = self.world_model.obs_encoder(obs)
 
         h = h.permute(1, 0, 2)  # [batch_size, HIDDEN_DIM]
-        h = h[:, -1]  # [batch_size, HIDDEN_DIM]
 
-        imag_h = h
-        imag_s = None  # Initialize latent state
+        # Initialize imag_h with h
+        imag_h = h.squeeze(1)  # [batch_size, HIDDEN_DIM]
+
+        # Initialize imag_s with posterior sample from initial obs
+        with torch.no_grad():
+            posterior_input = torch.cat([imag_h, obs_encoded], dim=-1)
+            posterior_logits = self.world_model.posterior_net(posterior_input)
+            posterior_logits = posterior_logits.view(
+                BATCH_SIZE, LATENT_DIM, LATENT_CATEGORIES
+            )
+            posterior_sample = gumbel_softmax(posterior_logits, hard=True).view(
+                BATCH_SIZE, -1
+            )
+            imag_s = posterior_sample
 
         imag_states = []
         imag_rewards = []
@@ -511,25 +565,29 @@ class DreamerV3:
         imag_action_probs = []
 
         for _ in range(IMAGINATION_HORIZON):
+            # Compute prior over latent state
+            prior_logits = self.world_model.prior_net(imag_h)
+            prior_logits = prior_logits.view(
+                BATCH_SIZE, LATENT_DIM, LATENT_CATEGORIES
+            )
+            imag_s = gumbel_softmax(prior_logits, hard=True).view(BATCH_SIZE, -1)
+
+            # Get action probabilities from actor
             action_probs = self.actor(imag_h)
             action_dist = torch.distributions.Categorical(probs=action_probs)
             imag_action = action_dist.sample()
-
             act_onehot = torch.nn.functional.one_hot(
                 imag_action, num_classes=self.act_dim
             ).float()
 
-            rnn_input = torch.cat([obs_encoded, act_onehot], dim=-1)
+            # Update imag_h using the RNN
+            rnn_input = torch.cat([imag_s, act_onehot], dim=-1)
             imag_h, _ = self.world_model.rnn(
                 rnn_input.unsqueeze(1), imag_h.unsqueeze(0)
             )
             imag_h = imag_h.squeeze(1)
 
-            prior_logits = self.world_model.prior_net(imag_h)
-            prior_logits = prior_logits.view(BATCH_SIZE, LATENT_DIM, LATENT_CATEGORIES)
-            prior_sample = gumbel_softmax(prior_logits, hard=True).view(BATCH_SIZE, -1)
-            imag_s = prior_sample
-
+            # Predict reward
             decoder_input = torch.cat([imag_h, imag_s], dim=-1)
             pred_reward = self.world_model.reward_decoder(decoder_input)
             imag_rewards.append(pred_reward.squeeze(-1))
@@ -569,7 +627,7 @@ class DreamerV3:
 
         # Actor update with Entropy Regularization
         imag_action_probs_flat = torch.cat(imag_action_probs, dim=0)
-        actor_loss = -q_values  # No detach here
+        actor_loss = -q_values.detach()  # Detach to prevent gradients flowing into critic
         entropy = -torch.sum(
             imag_action_probs_flat * torch.log(imag_action_probs_flat + 1e-8), dim=-1
         )
@@ -617,7 +675,9 @@ class DreamerV3:
 
     def _soft_update(self, target, source, tau=0.005):
         for target_param, param in zip(target.parameters(), source.parameters()):
-            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+            target_param.data.copy_(
+                tau * param.data + (1 - tau) * target_param.data
+            )
 
     def act(self, obs, reset=False):
         if reset:
@@ -631,7 +691,19 @@ class DreamerV3:
             else:
                 obs_encoded = self.world_model.obs_encoder(obs)
 
-            action_probs = self.actor(self.h[-1])
+            h = self.h  # [1, 1, HIDDEN_DIM]
+
+            # Compute posterior over latent variables
+            posterior_input = torch.cat([h.squeeze(0), obs_encoded], dim=-1)
+            posterior_logits = self.world_model.posterior_net(posterior_input)
+            posterior_logits = posterior_logits.view(
+                1, LATENT_DIM, LATENT_CATEGORIES
+            )
+            posterior_sample = gumbel_softmax(posterior_logits, hard=True).view(1, -1)
+            imag_s = posterior_sample  # [1, LATENT_DIM * LATENT_CATEGORIES]
+
+            # Get action probabilities from actor
+            action_probs = self.actor(h.squeeze(0))
             action_dist = torch.distributions.Categorical(probs=action_probs)
             action = action_dist.sample().cpu().numpy()[0]
 
@@ -639,8 +711,9 @@ class DreamerV3:
             act_onehot = torch.nn.functional.one_hot(
                 torch.tensor([action], device=device), num_classes=self.act_dim
             ).float()
-            rnn_input = torch.cat([obs_encoded, act_onehot], dim=-1)
-            self.h, _ = self.world_model.rnn(rnn_input.unsqueeze(1), self.h)
+
+            rnn_input = torch.cat([imag_s, act_onehot], dim=-1)
+            self.h, _ = self.world_model.rnn(rnn_input.unsqueeze(1), h)
             self.h = self.h.detach()  # Detach to prevent backprop through time
 
         return action
