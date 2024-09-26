@@ -1,0 +1,9 @@
+swig
+box2d-py
+torch
+matplotlib
+numpy
+gymnasium[all]
+gymnasium[accept-rom-license]
+imageio
+pandas
