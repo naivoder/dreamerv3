@@ -319,7 +319,7 @@ class WorldModel(nn.Module):
             + (1 - self.kl_balance_alpha) * kl_div_reverse
         )
         kl_loss = torch.clamp(kl_loss - self.free_nats, min=0.0).mean(dim=1)  # Mean over time steps
-        return kl_loss  # Shape: [batch_size]
+        return kl_loss * self.config.kl_scale  # Add a KL scale parameter
 
 
 
@@ -393,6 +393,13 @@ class DreamerV3:
         self.actor.apply(self.init_weights)
         self.critic.apply(self.init_weights)
         self.target_critic.apply(self.init_weights)
+
+        # Add reward scaler
+        self.reward_scaler = RewardScaler()
+
+        # Add observation normalizer if not using image observations
+        if not is_image:
+            self.obs_normalizer = ObsNormalizer(obs_shape)
 
     def init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -543,7 +550,7 @@ class DreamerV3:
 
         # Critic update
         values = self.critic(imag_states_flat)
-        critic_loss = F.mse_loss(values, returns_flat.detach())
+        critic_loss = F.smooth_l1_loss(values, returns_flat.detach())
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward(retain_graph=True)
@@ -553,15 +560,15 @@ class DreamerV3:
         # Actor update
         action_log_probs = torch.log(imag_action_probs_flat + 1e-8)
         selected_action_log_probs = action_log_probs.gather(1, imag_actions_flat.unsqueeze(1)).squeeze(1)
-        actor_loss = - (advantages_flat.detach() * selected_action_log_probs)
+        value_baseline = values.detach()
+        advantages = returns_flat - value_baseline
+        actor_loss = - (advantages * selected_action_log_probs).mean()
 
         # Entropy regularization
         entropy = -torch.sum(
             imag_action_probs_flat * torch.log(imag_action_probs_flat + 1e-8), dim=-1
         )
-        actor_loss -= self.config.entropy_scale * entropy
-
-        actor_loss = actor_loss.mean()
+        actor_loss -= self.config.entropy_scale * entropy.mean()
 
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
@@ -619,8 +626,14 @@ class DreamerV3:
         return action
 
     def store_transition(self, obs, act, rew, next_obs, done):
-        transition = (obs, act, rew, next_obs, done)
-        self.replay_buffer.store(transition)
+        if not self.is_image:
+            obs = self.obs_normalizer.normalize(obs)
+            next_obs = self.obs_normalizer.normalize(next_obs)
+            self.obs_normalizer.update(obs)
+
+        scaled_reward = self.reward_scaler.scale(rew)
+        self.reward_scaler.update(rew)
+        self.replay_buffer.store((obs, act, scaled_reward, next_obs, done))
 
     def train(self, num_updates):
         for _ in range(num_updates):
@@ -716,27 +729,28 @@ if __name__ == "__main__":
     parser.add_argument("--latent_dim", type=int, default=32)
     parser.add_argument("--latent_categories", type=int, default=32)
     parser.add_argument("--hidden_dim", type=int, default=2048)
-    parser.add_argument("--actor_lr", type=float, default=1e-3)
-    parser.add_argument("--critic_lr", type=float, default=1e-3)
-    parser.add_argument("--world_lr", type=float, default=1e-4)
+    parser.add_argument("--actor_lr", type=float, default=3e-4)
+    parser.add_argument("--critic_lr", type=float, default=3e-4)
+    parser.add_argument("--world_lr", type=float, default=3e-5)
     parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--imagination_horizon", type=int, default=15)
+    parser.add_argument("--imagination_horizon", type=int, default=50)
     parser.add_argument("--free_nats", type=float, default=0.0)
-    parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--seq_len", type=int, default=50)
+    parser.add_argument("--batch_size", type=int, default=256)
+    parser.add_argument("--seq_len", type=int, default=100)
     parser.add_argument("--replay_buffer_capacity", type=int, default=100000)
     parser.add_argument("--entropy_scale", type=float, default=0.001)
     parser.add_argument("--kl_balance_alpha", type=float, default=0.8)
     parser.add_argument("--lambda_", type=float, default=0.95)
-    parser.add_argument("--max_grad_norm", type=float, default=100)
+    parser.add_argument("--max_grad_norm", type=float, default=10.0)
     parser.add_argument("--weight_decay", type=float, default=1e-6)
     parser.add_argument("--num_updates", type=int, default=5)
     parser.add_argument("--min_buffer_size", type=int, default=1000)
-    parser.add_argument("--init_temperature", type=float, default=1.0)
-    parser.add_argument("--temperature_decay", type=float, default=0.9995)
-    parser.add_argument("--min_temperature", type=float, default=0.5)
+    parser.add_argument("--init_temperature", type=float, default=5.0)
+    parser.add_argument("--temperature_decay", type=float, default=0.99995)
+    parser.add_argument("--min_temperature", type=float, default=0.1)
     parser.add_argument("--actor_temperature", type=float, default=1.0)
     parser.add_argument("--tau", type=float, default=0.005)
+    parser.add_argument("--kl_scale", type=float, default=1.0)
     args = parser.parse_args()
 
     train_dreamer(args)
