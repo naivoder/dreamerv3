@@ -9,6 +9,8 @@ from torchvision import transforms
 from collections import deque
 import itertools
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+import imageio
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -491,6 +493,8 @@ class DreamerV3:
         torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), self.config.max_grad_norm)
         self.world_optimizer.step()
 
+        return loss_world.item()
+
     def update_actor_and_critic(self):
         # Imagined rollouts
         batch = self.replay_buffer.sample_batch(self.config.batch_size, 1)
@@ -620,6 +624,8 @@ class DreamerV3:
         # Update target critic
         self._soft_update(self.target_critic, self.critic)
 
+        return actor_loss.item(), critic_loss.item()
+
     def _soft_update(self, target, source, tau=None):
         if tau is None:
             tau = self.config.tau
@@ -678,11 +684,26 @@ class DreamerV3:
         self.replay_buffer.store((obs, act, scaled_reward, next_obs, done))
 
     def train(self, num_updates):
+        world_losses = []
+        actor_losses = []
+        critic_losses = []
+
         for _ in range(num_updates):
-            self.update_world_model()
-            self.update_actor_and_critic()
+            world_loss = self.update_world_model()
+            actor_loss, critic_loss = self.update_actor_and_critic()
+            
+            world_losses.append(world_loss)
+            actor_losses.append(actor_loss)
+            critic_losses.append(critic_loss)
+
             # Anneal temperature
             self.temperature = max(self.temperature * self.config.temperature_decay, self.config.min_temperature)
+
+        return {
+            'world_loss': np.mean(world_losses),
+            'actor_loss': np.mean(actor_losses),
+            'critic_loss': np.mean(critic_losses)
+        }
 
 
 
@@ -709,9 +730,14 @@ def train_dreamer(config):
     act_dim = env.action_space.n
     agent = DreamerV3(obs_shape, act_dim, is_image, config)
     total_rewards = []
+    world_losses = [] 
+    actor_losses = []  
+    critic_losses = []
 
     frame_idx = 0  # For temperature annealing
     avg_reward_window = 100  # Running average over the last 100 episodes
+    best_avg_reward = float('-inf')
+    best_weights = None
 
     with tqdm(total=config.episodes, desc="Training Progress", unit="episode") as pbar:
         for episode in range(config.episodes):
@@ -743,7 +769,10 @@ def train_dreamer(config):
 
                 if len(agent.replay_buffer) > config.min_buffer_size:
                     if frame_idx % config.train_horizon == 0:
-                        agent.train(num_updates=config.num_updates)
+                        losses = agent.train(num_updates=config.num_updates)
+                        world_losses.append(losses['world_loss'])
+                        actor_losses.append(losses['actor_loss'])
+                        critic_losses.append(losses['critic_loss'])
 
                 if done:
                     total_rewards.append(episode_reward)
@@ -757,8 +786,68 @@ def train_dreamer(config):
                     pbar.update(1)  # Update the progress bar for one episode completion
                     break
 
+            if len(total_rewards) >= avg_reward_window:
+                running_avg_reward = sum(total_rewards[-avg_reward_window:]) / avg_reward_window
+                if running_avg_reward > best_avg_reward:
+                    best_avg_reward = running_avg_reward
+                    best_weights = {
+                        'world_model': agent.world_model.state_dict(),
+                        'actor': agent.actor.state_dict(),
+                        'critic': agent.critic.state_dict()
+                    }
+
+    # Plot losses and rewards
+    plot_results(total_rewards, world_losses, actor_losses, critic_losses)
+
+    # Create animation
+    create_animation(env, agent, best_weights, config)
+
     return total_rewards
 
+def plot_results(rewards, world_losses, actor_losses, critic_losses):
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
+
+    # Plot rewards
+    ax1.plot(rewards, label='Episode Reward')
+    ax1.plot(np.convolve(rewards, np.ones(100)/100, mode='valid'), label='Running Average (100 episodes)')
+    ax1.set_xlabel('Episode')
+    ax1.set_ylabel('Reward')
+    ax1.set_title('Rewards over Episodes')
+    ax1.legend()
+
+    # Plot losses
+    ax2.plot(world_losses, label='World Model Loss')
+    ax2.plot(actor_losses, label='Actor Loss')
+    ax2.plot(critic_losses, label='Critic Loss')
+    ax2.set_xlabel('Update Step')
+    ax2.set_ylabel('Loss')
+    ax2.set_title('Losses over Update Steps')
+    ax2.legend()
+
+    plt.tight_layout()
+    plt.savefig('dreamer_results.png')
+    plt.close()
+
+def create_animation(env, agent, best_weights, config):
+    # Load best weights
+    agent.world_model.load_state_dict(best_weights['world_model'])
+    agent.actor.load_state_dict(best_weights['actor'])
+    agent.critic.load_state_dict(best_weights['critic'])
+
+    obs, _ = env.reset()
+    frames = []
+
+    for _ in range(1000):  # Adjust the number of steps as needed
+        frames.append(env.render())
+        action = agent.act(obs)
+        obs, _, done, _, _ = env.step(action)
+        if done:
+            break
+
+    env.close()
+
+    # Save animation as GIF
+    imageio.mimsave('dreamer_animation.gif', frames, fps=30)
 
 
 if __name__ == "__main__":
