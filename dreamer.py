@@ -12,6 +12,45 @@ from tqdm import tqdm
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+class RewardScaler:
+    def __init__(self, eps=1e-8):
+        self.mean = 0
+        self.std = 1
+        self.count = 0
+        self.eps = eps
+
+    def update(self, x):
+        self.count += 1
+        if self.count == 1:
+            self.mean = x
+        else:
+            old_mean = self.mean
+            self.mean += (x - old_mean) / self.count
+            self.std += (x - old_mean) * (x - self.mean)
+
+    def scale(self, x):
+        std = np.sqrt(self.std / (self.count + self.eps))
+        return (x - self.mean) / (std + self.eps)
+
+class ObsNormalizer:
+    def __init__(self, shape, eps=1e-8):
+        self.mean = np.zeros(shape, dtype=np.float32)
+        self.var = np.ones(shape, dtype=np.float32)
+        self.count = 0
+        self.eps = eps
+
+    def update(self, x):
+        self.count += 1
+        if self.count == 1:
+            self.mean = x
+        else:
+            old_mean = self.mean.copy()
+            self.mean += (x - old_mean) / self.count
+            self.var += (x - old_mean) * (x - self.mean)
+
+    def normalize(self, x):
+        std = np.sqrt(self.var / (self.count + self.eps))
+        return (x - self.mean) / (std + self.eps)   
 
 # Symlog functions
 def symlog(x):
@@ -319,7 +358,7 @@ class WorldModel(nn.Module):
             + (1 - self.kl_balance_alpha) * kl_div_reverse
         )
         kl_loss = torch.clamp(kl_loss - self.free_nats, min=0.0).mean(dim=1)  # Mean over time steps
-        return kl_loss * self.config.kl_scale  # Add a KL scale parameter
+        return kl_loss
 
 
 
@@ -368,6 +407,9 @@ class DreamerV3:
         self.critic = Critic(config.hidden_dim, config).to(device)
         self.target_critic = Critic(config.hidden_dim, config).to(device)
         self.target_critic.load_state_dict(self.critic.state_dict())
+
+        self.reward_scaler = RewardScaler()
+        self.obs_normalizer = ObsNormalizer(obs_shape)
 
         self.world_optimizer = optim.Adam(
             self.world_model.parameters(), lr=config.world_lr, weight_decay=config.weight_decay
@@ -643,7 +685,6 @@ class DreamerV3:
             self.temperature = max(self.temperature * self.config.temperature_decay, self.config.min_temperature)
 
 
-from tqdm import tqdm
 
 def train_dreamer(config):
     env = gym.make(config.env)
@@ -724,32 +765,32 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", type=str, default="CartPole-v1")
-    parser.add_argument("--episodes", type=int, default=10000)
-    parser.add_argument("--train_horizon", type=int, default=100)
+    parser.add_argument("--episodes", type=int, default=100000)
+    parser.add_argument("--train_horizon", type=int, default=1)
     parser.add_argument("--latent_dim", type=int, default=32)
     parser.add_argument("--latent_categories", type=int, default=32)
-    parser.add_argument("--hidden_dim", type=int, default=2048)
-    parser.add_argument("--actor_lr", type=float, default=3e-4)
-    parser.add_argument("--critic_lr", type=float, default=3e-4)
-    parser.add_argument("--world_lr", type=float, default=3e-5)
+    parser.add_argument("--hidden_dim", type=int, default=512)  
+    parser.add_argument("--actor_lr", type=float, default=1e-4) 
+    parser.add_argument("--critic_lr", type=float, default=1e-4) 
+    parser.add_argument("--world_lr", type=float, default=3e-4)  
     parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--imagination_horizon", type=int, default=50)
-    parser.add_argument("--free_nats", type=float, default=0.0)
-    parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--seq_len", type=int, default=100)
-    parser.add_argument("--replay_buffer_capacity", type=int, default=100000)
-    parser.add_argument("--entropy_scale", type=float, default=0.001)
+    parser.add_argument("--imagination_horizon", type=int, default=15)  
+    parser.add_argument("--free_nats", type=float, default=3.0)  
+    parser.add_argument("--batch_size", type=int, default=50)  
+    parser.add_argument("--seq_len", type=int, default=50) 
+    parser.add_argument("--replay_buffer_capacity", type=int, default=1000000)  
+    parser.add_argument("--entropy_scale", type=float, default=1e-3)  
     parser.add_argument("--kl_balance_alpha", type=float, default=0.8)
     parser.add_argument("--lambda_", type=float, default=0.95)
-    parser.add_argument("--max_grad_norm", type=float, default=10.0)
-    parser.add_argument("--weight_decay", type=float, default=1e-6)
-    parser.add_argument("--num_updates", type=int, default=5)
-    parser.add_argument("--min_buffer_size", type=int, default=1000)
-    parser.add_argument("--init_temperature", type=float, default=5.0)
-    parser.add_argument("--temperature_decay", type=float, default=0.99995)
+    parser.add_argument("--max_grad_norm", type=float, default=100.0)  
+    parser.add_argument("--weight_decay", type=float, default=0.0)  
+    parser.add_argument("--num_updates", type=int, default=1)  
+    parser.add_argument("--min_buffer_size", type=int, default=5000) 
+    parser.add_argument("--init_temperature", type=float, default=0.1)  
+    parser.add_argument("--temperature_decay", type=float, default=1.0)  
     parser.add_argument("--min_temperature", type=float, default=0.1)
-    parser.add_argument("--actor_temperature", type=float, default=1.0)
-    parser.add_argument("--tau", type=float, default=0.005)
+    parser.add_argument("--actor_temperature", type=float, default=0.1) 
+    parser.add_argument("--tau", type=float, default=0.02) 
     parser.add_argument("--kl_scale", type=float, default=1.0)
     args = parser.parse_args()
 
