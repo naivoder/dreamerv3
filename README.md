@@ -1,6 +1,11 @@
 # DreamerV3
 
+🚫🚧👷‍♀️ Warning: Under Construction 👷‍♂️🚧🚫
+
 This repository contains a PyTorch implementation of the DreamerV3 algorithm, aimed at providing a more readable and understandable version compared to the official implementations. It serves as an opportunity to learn and explore the intricacies of the DreamerV3 algorithm while maintaining clarity and simplicity.
+
+My critic loss appears to be exploding... 🐛🪲🐞
+![dreamer_results](dreamer_results.png)
 
 ## Overview
 
