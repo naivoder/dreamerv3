@@ -14,25 +14,6 @@ import imageio
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-class RewardScaler:
-    def __init__(self, eps=1e-8):
-        self.mean = 0
-        self.std = 1
-        self.count = 0
-        self.eps = eps
-
-    def update(self, x):
-        self.count += 1
-        if self.count == 1:
-            self.mean = x
-        else:
-            old_mean = self.mean
-            self.mean += (x - old_mean) / self.count
-            self.std += (x - old_mean) * (x - self.mean)
-
-    def scale(self, x):
-        std = np.sqrt(self.std / (self.count + self.eps))
-        return (x - self.mean) / (std + self.eps)
 
 class ObsNormalizer:
     def __init__(self, shape, eps=1e-8):
@@ -275,7 +256,7 @@ class WorldModel(nn.Module):
             posterior_input = torch.cat([h.transpose(0, 1).squeeze(1), obs_encoded[:, t]], dim=-1)
             posterior_logits = self.posterior_net(posterior_input)
             posterior_logits = posterior_logits.view(batch_size, self.latent_dim, self.latent_categories)
-            posterior_sample = gumbel_softmax(posterior_logits, tau=tau, hard=True)
+            posterior_sample = gumbel_softmax(posterior_logits, tau=tau, hard=False)
             posterior_sample_flat = posterior_sample.view(batch_size, -1)
             
             posterior_logits_list.append(posterior_logits)
@@ -332,14 +313,13 @@ class WorldModel(nn.Module):
         prior_dist = torch.distributions.Categorical(logits=prior_logits)
         posterior_dist = torch.distributions.Categorical(logits=posterior_logits)
 
-        kl_div_forward = torch.distributions.kl_divergence(posterior_dist, prior_dist)
-        kl_div_reverse = torch.distributions.kl_divergence(prior_dist, posterior_dist)
+        kl_div_forward = torch.sum(posterior_dist.probs * (posterior_dist.logits - prior_dist.logits), dim=-1)
+        kl_div_reverse = torch.sum(prior_dist.probs * (prior_dist.logits - posterior_dist.logits), dim=-1)
 
         kl_loss = self.kl_balance_alpha * kl_div_forward + (1 - self.kl_balance_alpha) * kl_div_reverse
-        kl_loss = kl_loss.sum(dim=2)  # Sum over latent dimensions
-        kl_loss = torch.clamp(kl_loss - self.free_nats, min=0.0).mean()  # Mean over batch and time steps
+        kl_loss = kl_loss.sum(dim=-1)  # Sum over latent dimensions
+        kl_loss = torch.clamp(kl_loss - self.free_nats, min=0.0).mean() # Mean over batch and time steps
         return kl_loss
-
 
 # Actor Network for Discrete Actions with Temperature Scaling
 class Actor(nn.Module):
@@ -386,16 +366,15 @@ class DreamerV3:
         self.target_critic = Critic(config.hidden_dim, config).to(device)
         self.target_critic.load_state_dict(self.critic.state_dict())
 
-        self.reward_scaler = RewardScaler()
         self.obs_normalizer = ObsNormalizer(obs_shape)
 
-        self.world_optimizer = optim.Adam(
+        self.world_optimizer = optim.AdamW(
             self.world_model.parameters(), lr=config.world_lr, weight_decay=config.weight_decay
         )
-        self.actor_optimizer = optim.Adam(
+        self.actor_optimizer = optim.AdamW(
             self.actor.parameters(), lr=config.actor_lr, weight_decay=config.weight_decay
         )
-        self.critic_optimizer = optim.Adam(
+        self.critic_optimizer = optim.AdamW(
             self.critic.parameters(), lr=config.critic_lr, weight_decay=config.weight_decay
         )
 
@@ -413,9 +392,6 @@ class DreamerV3:
         self.actor.apply(self.init_weights)
         self.critic.apply(self.init_weights)
         self.target_critic.apply(self.init_weights)
-
-        # Add reward scaler
-        self.reward_scaler = RewardScaler()
 
         # Add observation normalizer if not using image observations
         if not is_image:
@@ -453,6 +429,7 @@ class DreamerV3:
         pred_reward = outputs["pred_reward"]
         kl_loss = outputs["kl_loss"]
 
+
         # Reconstruction loss
         if self.is_image:
             recon_loss = F.mse_loss(recon_obs, obs_seq, reduction='none')
@@ -468,7 +445,7 @@ class DreamerV3:
         reward_loss = reward_loss.mean()
 
         # Total loss
-        loss_world = recon_loss + reward_loss + kl_loss
+        loss_world = recon_loss + reward_loss + self.config.kl_scale * kl_loss
 
         self.world_optimizer.zero_grad()
         loss_world.backward()
@@ -532,7 +509,8 @@ class DreamerV3:
             # Predict reward
             decoder_input = torch.cat([imag_h.squeeze(0), imag_s], dim=-1)
             pred_reward = self.world_model.reward_decoder(decoder_input)
-            imag_rewards.append(pred_reward.squeeze(-1))
+            pred_reward = symexp(pred_reward.squeeze(-1))
+            imag_rewards.append(pred_reward)
 
         # Convert lists to tensors
         imag_states = torch.stack(imag_states)  
@@ -640,9 +618,7 @@ class DreamerV3:
             next_obs = self.obs_normalizer.normalize(next_obs)
             self.obs_normalizer.update(obs)
 
-        scaled_reward = self.reward_scaler.scale(rew)
-        self.reward_scaler.update(rew)
-        self.replay_buffer.store(obs, act, scaled_reward, next_obs, done)
+        self.replay_buffer.store(obs, act, rew, next_obs, done)
 
     def train(self, num_updates):
         world_losses = []
@@ -832,7 +808,7 @@ if __name__ == "__main__":
     parser.add_argument("--entropy_scale", type=float, default=1e-3)  
     parser.add_argument("--kl_balance_alpha", type=float, default=0.8)
     parser.add_argument("--lambda_", type=float, default=0.95)
-    parser.add_argument("--max_grad_norm", type=float, default=100.0)  
+    parser.add_argument("--max_grad_norm", type=float, default=10.0)  
     parser.add_argument("--weight_decay", type=float, default=0.0)  
     parser.add_argument("--num_updates", type=int, default=1)  
     parser.add_argument("--min_buffer_size", type=int, default=5000) 
