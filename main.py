@@ -134,7 +134,7 @@ def plot_results(rewards, world_losses, actor_losses, critic_losses):
     plt.close()
 
 
-def create_animation(env, agent, best_weights, config):
+def create_animation(env, agent, best_weights, filename="dreamer_animation.gif"):
     # Load best weights
     agent.world_model.load_state_dict(best_weights['world_model'])
     agent.actor.load_state_dict(best_weights['actor'])
@@ -153,7 +153,9 @@ def create_animation(env, agent, best_weights, config):
     env.close()
 
     # Save animation as GIF
-    imageio.mimsave('dreamer_animation.gif', np.array(frames), fps=30)
+    with imageio.get_writer(filename, mode="I", loop=0) as writer:
+        for frame in frames:
+            writer.append_data(frame)
 
 
 if __name__ == "__main__":
@@ -161,7 +163,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", type=str, default="CartPole-v1")
     parser.add_argument("--episodes", type=int, default=10000)
-    parser.add_argument("--train_horizon", type=int, default=1000)
+    parser.add_argument("--train_horizon", type=int, default=1)
     parser.add_argument("--latent_dim", type=int, default=32)
     parser.add_argument("--latent_categories", type=int, default=32)
     parser.add_argument("--hidden_dim", type=int, default=512)
