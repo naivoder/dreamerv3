@@ -1,4 +1,3 @@
-# Convolutional Encoder for Image Observations
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
@@ -123,6 +122,12 @@ class WorldModel(nn.Module):
             nn.ReLU(),
             nn.Linear(config.hidden_dim, 1),
         )
+        self.discount_decoder = nn.Sequential(
+            nn.Linear(config.hidden_dim + config.latent_dim * config.latent_categories, config.hidden_dim),
+            nn.ReLU(),
+            nn.Linear(config.hidden_dim, 1),
+            nn.Sigmoid(),  # Output between 0 and 1
+        )
 
     def forward(self, obs_seq, act_seq, tau):
         batch_size, seq_len = obs_seq.size(0), obs_seq.size(1)
@@ -181,7 +186,7 @@ class WorldModel(nn.Module):
         # Compute KL divergence
         kl_loss = self.compute_kl_loss(prior_logits, posterior_logits)
 
-        # Decode observation and reward
+        # Decode observation, reward, and discount
         decoder_input = torch.cat([h_seq, posterior_samples], dim=-1)  # [batch_size, seq_len, hidden_dim + latent_dim * latent_categories]
         decoder_input_flat = decoder_input.view(batch_size * seq_len, -1)
 
@@ -195,9 +200,13 @@ class WorldModel(nn.Module):
         pred_reward = self.reward_decoder(decoder_input_flat)
         pred_reward = pred_reward.view(batch_size, seq_len)
 
+        pred_discount = self.discount_decoder(decoder_input_flat)
+        pred_discount = pred_discount.view(batch_size, seq_len)
+
         outputs = {
             "recon_obs": recon_obs,
             "pred_reward": pred_reward,
+            "pred_discount": pred_discount,
             "kl_loss": kl_loss,
             "rnn_h": h_seq,
             "posterior_sample": posterior_samples,

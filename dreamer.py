@@ -54,19 +54,34 @@ class DreamerV3:
             self.obs_normalizer = ObsNormalizer(obs_shape)
 
     def init_weights(self, m):
-        if isinstance(m, (nn.Linear, nn.Conv2d, nn.ConvTranspose2d)):
-            fan_in = m.weight.shape[1]
-            fan_out = m.weight.shape[0]
-            limit = np.sqrt(6 / (fan_in + fan_out))
-            nn.init.uniform_(m.weight, -limit, limit)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.GRUCell):
-            for name, param in m.named_parameters():
-                if 'weight' in name:
-                    nn.init.orthogonal_(param)
-                elif 'bias' in name:
-                    nn.init.zeros_(param)
+
+        if isinstance(m, nn.Linear):
+            in_num = m.in_features
+            out_num = m.out_features
+            denoms = (in_num + out_num) / 2.0
+            scale = 1.0 / denoms
+            std = np.sqrt(scale) / 0.87962566103423978
+            nn.init.trunc_normal_(
+                m.weight.data, mean=0.0, std=std, a=-2.0 * std, b=2.0 * std
+            )
+            if hasattr(m.bias, "data"):
+                m.bias.data.fill_(0.0)
+        elif isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
+            space = m.kernel_size[0] * m.kernel_size[1]
+            in_num = space * m.in_channels
+            out_num = space * m.out_channels
+            denoms = (in_num + out_num) / 2.0
+            scale = 1.0 / denoms
+            std = np.sqrt(scale) / 0.87962566103423978
+            nn.init.trunc_normal_(
+                m.weight.data, mean=0.0, std=std, a=-2.0 * std, b=2.0 * std
+            )
+            if hasattr(m.bias, "data"):
+                m.bias.data.fill_(0.0)
+        elif isinstance(m, nn.LayerNorm):
+            m.weight.data.fill_(1.0)
+            if hasattr(m.bias, "data"):
+                m.bias.data.fill_(0.0)
 
     def reset_hidden_states(self):
         self.h = torch.zeros(1, 1, self.config.hidden_dim, device=device)
@@ -79,11 +94,12 @@ class DreamerV3:
         except ValueError:
             return  # Not enough data to train
 
-        obs_seq, act_seq, rew_seq, _, _ = batch
+        obs_seq, act_seq, rew_seq, next_obs_seq, done_seq = batch
 
         outputs = self.world_model(obs_seq, act_seq, tau=self.temperature)
         recon_obs = outputs["recon_obs"]
         pred_reward = outputs["pred_reward"]
+        pred_discount = outputs["pred_discount"]
         kl_loss = outputs["kl_loss"]
 
         # Reconstruction loss
@@ -100,8 +116,13 @@ class DreamerV3:
         reward_loss = F.mse_loss(pred_reward, symlog(rew_seq), reduction='none')
         reward_loss = reward_loss.mean()
 
+        # Discount prediction loss
+        discount_target = (1.0 - done_seq.float()) * self.config.lambda_
+        discount_loss = F.binary_cross_entropy(pred_discount, discount_target, reduction='none')
+        discount_loss = discount_loss.mean()
+
         # Total loss
-        loss_world = recon_loss + reward_loss + self.config.kl_scale * kl_loss
+        loss_world = recon_loss + reward_loss + discount_loss + self.config.kl_scale * kl_loss
 
         self.world_optimizer.zero_grad()
         loss_world.backward()
@@ -120,13 +141,13 @@ class DreamerV3:
         obs_seq, act_seq, _, _, _ = batch
         obs = obs_seq[:, 0]
 
-        # Initialize hidden state with zeros
-        imag_h = torch.zeros(1, self.config.batch_size, self.config.hidden_dim, device=device)
-
         # Encode observation
         obs_encoded = self.world_model.obs_encoder(obs)
 
-        # Initialize imag_s with posterior sample from initial obs
+        # Initialize hidden state
+        imag_h = torch.zeros(1, self.config.batch_size, self.config.hidden_dim, device=device)
+
+        # Compute initial posterior state
         posterior_input = torch.cat([imag_h.squeeze(0), obs_encoded], dim=-1)
         posterior_logits = self.world_model.posterior_net(posterior_input)
         posterior_logits = posterior_logits.view(
@@ -136,6 +157,7 @@ class DreamerV3:
 
         imag_states = []
         imag_rewards = []
+        imag_discounts = []
         imag_action_log_probs = []
 
         for _ in range(self.config.imagination_horizon):
@@ -149,7 +171,7 @@ class DreamerV3:
 
             # Update imag_h and imag_s using the world model
             act_onehot = F.one_hot(imag_action, num_classes=self.act_dim).float()
-            rnn_input = torch.cat([imag_s.detach(), act_onehot], dim=-1)
+            rnn_input = torch.cat([imag_s, act_onehot], dim=-1)
             rnn_input = rnn_input.unsqueeze(1)  # Shape: [batch_size, 1, input_size]
 
             # RNN step
@@ -162,32 +184,42 @@ class DreamerV3:
             )
             imag_s = gumbel_softmax(prior_logits, tau=self.temperature, hard=False).view(self.config.batch_size, -1)
 
-            # Predict reward
+            # Predict reward and discount
             decoder_input = torch.cat([imag_h.squeeze(0), imag_s], dim=-1)
             pred_reward = self.world_model.reward_decoder(decoder_input)
-            pred_reward = symexp(pred_reward.squeeze(-1))
+            pred_reward = pred_reward.squeeze(-1)
             imag_rewards.append(pred_reward)
 
+            pred_discount = self.world_model.discount_decoder(decoder_input)
+            pred_discount = pred_discount.squeeze(-1)
+            imag_discounts.append(pred_discount * self.config.lambda_)
+
         # Convert lists to tensors
-        imag_states = torch.stack(imag_states)
-        imag_rewards = torch.stack(imag_rewards)
-        imag_action_log_probs = torch.stack(imag_action_log_probs)
+        imag_states = torch.stack(imag_states)  # Shape: [imagination_horizon, batch_size, hidden_dim]
+        imag_rewards = torch.stack(imag_rewards)  # Shape: [imagination_horizon, batch_size]
+        imag_discounts = torch.stack(imag_discounts)  # Shape: [imagination_horizon, batch_size]
+        imag_action_log_probs = torch.stack(imag_action_log_probs)  # Shape: [imagination_horizon, batch_size]
 
         # Reshape imag_states for critic input
         imag_states_flat = imag_states.view(-1, self.config.hidden_dim)
 
         # Get value estimates for critic update (detach to prevent backprop through the world model)
         value_pred = self.critic(imag_states_flat.detach()).view(self.config.imagination_horizon, self.config.batch_size)
+        self.q_values = value_pred[0, :].detach().cpu().numpy()  # Save for logging
 
-        # Calculate lambda-returns
-        lambda_returns = torch.zeros_like(imag_rewards)
-        last_value = value_pred[-1]
-        for t in reversed(range(self.config.imagination_horizon)):
-            if t == self.config.imagination_horizon - 1:
-                bootstrap = last_value
-            else:
-                bootstrap = (1 - self.config.lambda_) * value_pred[t + 1] + self.config.lambda_ * lambda_returns[t + 1]
-            lambda_returns[t] = imag_rewards[t] + self.config.gamma * bootstrap
+        # Bootstrap value is the last value prediction
+        bootstrap = value_pred[-1]
+
+        # Compute lambda returns
+        lambda_returns = self.lambda_return(
+            reward=imag_rewards,
+            value=value_pred,
+            pcont=imag_discounts,
+            bootstrap=bootstrap,
+            lambda_=self.config.lambda_,
+        )
+
+        self.returns = lambda_returns[0, :].detach().cpu().numpy()  # Save for logging
 
         # Critic update
         value_target = lambda_returns.detach()
@@ -216,10 +248,28 @@ class DreamerV3:
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.config.max_grad_norm)
         self.actor_optimizer.step()
 
-        # Update target critic
+        # Update target critic using soft update
         self._soft_update(self.target_critic, self.critic)
 
         return actor_loss.item(), critic_loss.item()
+
+    def lambda_return(self, reward, value, pcont, bootstrap, lambda_):
+        next_values = torch.cat([value[1:], bootstrap[None]], 0)
+        inputs = reward + pcont * next_values * (1 - lambda_)
+        returns = self._static_scan(
+            lambda agg, cur0, cur1: cur0 + cur1 * lambda_ * agg, (inputs, pcont), bootstrap
+        )
+        return returns
+
+    def _static_scan(self, fn, inputs, start):
+        last = start
+        outputs = []
+        for index in reversed(range(inputs[0].shape[0])):
+            inp = [input[index] for input in inputs]
+            last = fn(last, *inp)
+            outputs.append(last)
+        outputs = torch.stack(outputs[::-1], dim=0)
+        return outputs
 
     def _soft_update(self, target, source, tau=None):
         if tau is None:
