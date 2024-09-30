@@ -11,7 +11,8 @@ from dreamer import DreamerV3
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def train_dreamer(config):
-    env = gym.make(config.env)
+    env = gym.make(config.env, render_mode="rgb_array")
+    
     # Determine if the observation space is image-based or vector-based
     obs_space = env.observation_space
     is_image = isinstance(obs_space, gym.spaces.Box) and len(obs_space.shape) == 3
@@ -163,7 +164,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", type=str, default="CartPole-v1")
     parser.add_argument("--episodes", type=int, default=10000)
-    parser.add_argument("--train_horizon", type=int, default=1)
+    parser.add_argument("--train_horizon", type=int, default=10)
     parser.add_argument("--latent_dim", type=int, default=32)
     parser.add_argument("--latent_categories", type=int, default=32)
     parser.add_argument("--hidden_dim", type=int, default=512)
@@ -181,7 +182,7 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_", type=float, default=0.95)
     parser.add_argument("--max_grad_norm", type=float, default=100.0)
     parser.add_argument("--weight_decay", type=float, default=1e-6)
-    parser.add_argument("--num_updates", type=int, default=5)
+    parser.add_argument("--num_updates", type=int, default=1)
     parser.add_argument("--min_buffer_size", type=int, default=5000)
     parser.add_argument("--init_temperature", type=float, default=1.0)
     parser.add_argument("--temperature_decay", type=float, default=0.999)
