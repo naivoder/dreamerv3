@@ -12,7 +12,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def train_dreamer(config):
     env = gym.make(config.env, render_mode="rgb_array")
-    
+
     # Determine if the observation space is image-based or vector-based
     obs_space = env.observation_space
     is_image = isinstance(obs_space, gym.spaces.Box) and len(obs_space.shape) == 3
@@ -105,7 +105,7 @@ def train_dreamer(config):
     plot_results(total_rewards, world_losses, actor_losses, critic_losses)
 
     # Create animation
-    create_animation(env, agent, best_weights, config)
+    create_animation(env, agent, best_weights, filename="dreamer_animation.gif")
 
     return total_rewards
 
@@ -164,17 +164,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", type=str, default="CartPole-v1")
     parser.add_argument("--episodes", type=int, default=10000)
-    parser.add_argument("--train_horizon", type=int, default=10)
+    parser.add_argument("--train_horizon", type=int, default=100)
     parser.add_argument("--latent_dim", type=int, default=32)
     parser.add_argument("--latent_categories", type=int, default=32)
     parser.add_argument("--hidden_dim", type=int, default=512)
     parser.add_argument("--actor_lr", type=float, default=3e-5)
-    parser.add_argument("--critic_lr", type=float, default=3e-5)
+    parser.add_argument("--critic_lr", type=float, default=1e-5)
     parser.add_argument("--world_lr", type=float, default=1e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--imagination_horizon", type=int, default=15)
     parser.add_argument("--free_nats", type=float, default=3.0)
-    parser.add_argument("--batch_size", type=int, default=300)
+    parser.add_argument("--batch_size", type=int, default=1000)
     parser.add_argument("--seq_len", type=int, default=50)
     parser.add_argument("--replay_buffer_capacity", type=int, default=100000)
     parser.add_argument("--entropy_scale", type=float, default=1e-3)
@@ -182,11 +182,11 @@ if __name__ == "__main__":
     parser.add_argument("--lambda_", type=float, default=0.95)
     parser.add_argument("--max_grad_norm", type=float, default=100.0)
     parser.add_argument("--weight_decay", type=float, default=1e-6)
-    parser.add_argument("--num_updates", type=int, default=1)
+    parser.add_argument("--num_updates", type=int, default=5)
     parser.add_argument("--min_buffer_size", type=int, default=5000)
     parser.add_argument("--init_temperature", type=float, default=1.0)
     parser.add_argument("--temperature_decay", type=float, default=0.999)
-    parser.add_argument("--min_temperature", type=float, default=0.2)
+    parser.add_argument("--min_temperature", type=float, default=0.8)
     parser.add_argument("--actor_temperature", type=float, default=1.0)
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--kl_scale", type=float, default=1.0)
