@@ -7,3 +7,5 @@ gymnasium[all]
 gymnasium[accept-rom-license]
 imageio
 pandas
+psutil
+zmq
