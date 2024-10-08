@@ -9,3 +9,4 @@ imageio
 pandas
 psutil
 zmq
+termcolor
