@@ -1,7 +1,7 @@
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
-
+import numpy as np
 from utils import gumbel_softmax
 
 class ConvEncoder(nn.Module):
@@ -62,8 +62,9 @@ class MLPEncoder(nn.Module):
     def __init__(self, obs_dim, config):
         super(MLPEncoder, self).__init__()
         self.net = nn.Sequential(
-            nn.LayerNorm(obs_dim),
-            nn.Linear(obs_dim, config.hidden_dim),
+            nn.Flatten(),  # Add this line to flatten the input
+            nn.LayerNorm(np.prod(obs_dim)),  # Use np.prod to handle multi-dimensional inputs
+            nn.Linear(np.prod(obs_dim), config.hidden_dim),
             nn.ReLU(),
             nn.Linear(config.hidden_dim, config.hidden_dim),
             nn.ReLU(),
@@ -89,10 +90,11 @@ class MLPDecoder(nn.Module):
 
 # World Model with Discrete Latent Representations and KL Balancing
 class WorldModel(nn.Module):
-    def __init__(self, obs_shape, act_dim, is_image, config):
+    def __init__(self, obs_shape, act_dim, is_image, is_discrete, config):
         super(WorldModel, self).__init__()
         self.is_image = is_image
         self.act_dim = act_dim
+        self.is_discrete = is_discrete
         self.hidden_dim = config.hidden_dim
         self.latent_dim = config.latent_dim
         self.latent_categories = config.latent_categories
@@ -140,8 +142,11 @@ class WorldModel(nn.Module):
         obs_encoded = self.obs_encoder(obs_seq)
         obs_encoded = obs_encoded.view(batch_size, seq_len, -1)
 
-        # One-hot encode actions
-        act_seq_onehot = F.one_hot(act_seq, num_classes=self.act_dim).float()  # Shape: [batch_size, seq_len, act_dim]
+        # One-hot encode actions if discrete, otherwise use as is
+        if self.is_discrete:
+            act_seq_onehot = F.one_hot(act_seq.long(), num_classes=self.act_dim).float()
+        else:
+            act_seq_onehot = act_seq
 
         # Initialize hidden state
         h = torch.zeros(1, batch_size, self.hidden_dim, device=obs_seq.device)
@@ -235,19 +240,38 @@ class WorldModel(nn.Module):
 
 # Actor Network for Discrete Actions with Temperature Scaling
 class Actor(nn.Module):
-    def __init__(self, state_dim, act_dim, config):
+    def __init__(self, state_dim, act_dim, is_discrete, config):
         super(Actor, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(state_dim, config.hidden_dim),
-            nn.ReLU(),
-            nn.Linear(config.hidden_dim, act_dim),
-        )
+        self.is_discrete = is_discrete
         self.temperature = config.actor_temperature
 
+        if is_discrete:
+            self.net = nn.Sequential(
+                nn.Linear(state_dim, config.hidden_dim),
+                nn.ReLU(),
+                nn.Linear(config.hidden_dim, act_dim),
+            )
+        else:
+            self.mean = nn.Sequential(
+                nn.Linear(state_dim, config.hidden_dim),
+                nn.ReLU(),
+                nn.Linear(config.hidden_dim, act_dim),
+            )
+            self.log_std = nn.Sequential(
+                nn.Linear(state_dim, config.hidden_dim),
+                nn.ReLU(),
+                nn.Linear(config.hidden_dim, act_dim),
+            )
+
     def forward(self, x):
-        logits = self.net(x)
-        action_probs = torch.softmax(logits / self.temperature, dim=-1)
-        return action_probs
+        if self.is_discrete:
+            logits = self.net(x)
+            action_probs = torch.softmax(logits / self.temperature, dim=-1)
+            return action_probs
+        else:
+            mean = self.mean(x)
+            std = torch.exp(self.log_std(x))
+            return mean, std
 
 
 # Critic Network

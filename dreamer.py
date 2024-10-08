@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import torch.nn.functional as F
+import gym
 
 from utils import gumbel_softmax, symlog, symexp, ObsNormalizer, ReplayBuffer
 from networks import WorldModel, Actor, Critic
@@ -10,14 +11,20 @@ from networks import WorldModel, Actor, Critic
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class DreamerV3:
-    def __init__(self, obs_shape, act_dim, is_image, config):
+    def __init__(self, obs_shape, act_space, is_image, is_discrete, config):
         self.config = config
         self.obs_shape = obs_shape
-        self.act_dim = act_dim
         self.is_image = is_image
+        self.is_discrete = is_discrete
+        print("Is Discrete: ", self.is_discrete)
+        
+        if self.is_discrete:
+            self.act_dim = act_space.n
+        else:
+            self.act_dim = act_space.shape[0]
 
-        self.world_model = WorldModel(obs_shape, act_dim, is_image, config).to(device)
-        self.actor = Actor(config.hidden_dim, act_dim, config).to(device)
+        self.world_model = WorldModel(obs_shape, self.act_dim, is_image, is_discrete, config).to(device)
+        self.actor = Actor(config.hidden_dim, self.act_dim, self.is_discrete, config).to(device)
         self.critic = Critic(config.hidden_dim, config).to(device)
         self.target_critic = Critic(config.hidden_dim, config).to(device)
         self.target_critic.load_state_dict(self.critic.state_dict())
@@ -34,7 +41,7 @@ class DreamerV3:
             self.critic.parameters(), lr=config.critic_lr, weight_decay=config.weight_decay
         )
 
-        self.replay_buffer = ReplayBuffer(config.replay_buffer_capacity, obs_shape, act_dim)
+        self.replay_buffer = ReplayBuffer(config.replay_buffer_capacity, obs_shape, self.act_dim)
 
         # Hidden states
         self.h = None
@@ -165,12 +172,21 @@ class DreamerV3:
 
             # Get action probabilities from actor
             action_probs = self.actor(imag_h.squeeze(0))
-            action_dist = torch.distributions.Categorical(probs=action_probs)
-            imag_action = action_dist.sample()
-            imag_action_log_probs.append(action_dist.log_prob(imag_action))
+            if self.is_discrete:
+                action_dist = torch.distributions.Categorical(probs=action_probs)
+                imag_action = action_dist.sample()
+                imag_action_log_probs.append(action_dist.log_prob(imag_action))
+            else:
+                action_mean, action_std = action_probs
+                action_dist = torch.distributions.Normal(action_mean, action_std)
+                imag_action = action_dist.sample()
+                imag_action_log_probs.append(action_dist.log_prob(imag_action))
 
             # Update imag_h and imag_s using the world model
-            act_onehot = F.one_hot(imag_action, num_classes=self.act_dim).float()
+            if self.is_discrete:
+                act_onehot = F.one_hot(imag_action, num_classes=self.act_dim).float()
+            else:
+                act_onehot = imag_action.float()
             rnn_input = torch.cat([imag_s, act_onehot], dim=-1)
             rnn_input = rnn_input.unsqueeze(1)  # Shape: [batch_size, 1, input_size]
 
@@ -238,9 +254,14 @@ class DreamerV3:
 
         # Entropy regularization
         action_probs = self.actor(imag_states_flat)
-        action_probs = action_probs.view(self.config.imagination_horizon, self.config.batch_size, -1)
-        action_log_probs = torch.log(action_probs + 1e-8)
-        entropy = -torch.sum(action_probs * action_log_probs, dim=-1).mean()
+        if self.is_discrete:
+            action_probs = action_probs.view(self.config.imagination_horizon, self.config.batch_size, -1)
+            action_log_probs = torch.log(action_probs + 1e-8)
+            entropy = -torch.sum(action_probs * action_log_probs, dim=-1).mean()
+        else:
+            action_mean, action_std = action_probs
+            action_dist = torch.distributions.Normal(action_mean, action_std)
+            entropy = action_dist.entropy().mean()
         actor_loss += -self.config.entropy_scale * entropy
 
         self.actor_optimizer.zero_grad()
@@ -295,6 +316,7 @@ class DreamerV3:
 
             # Compute posterior over latent variables
             h = self.h.squeeze(0)  # Shape: [1, hidden_dim]
+            
             posterior_input = torch.cat([h, obs_encoded], dim=-1)
             posterior_logits = self.world_model.posterior_net(posterior_input)
             posterior_logits = posterior_logits.view(
@@ -304,13 +326,21 @@ class DreamerV3:
 
             # Get action probabilities from actor
             action_probs = self.actor(h)
-            action_dist = torch.distributions.Categorical(probs=action_probs)
-            action = action_dist.sample().cpu().numpy()[0]
+            if self.is_discrete:
+                action_dist = torch.distributions.Categorical(probs=action_probs)
+                action = action_dist.sample().cpu().numpy()[0]
+            else:
+                action_mean, action_std = action_probs
+                action_dist = torch.distributions.Normal(action_mean, action_std)
+                action = action_dist.sample().cpu().numpy()
 
             # Update hidden state
-            act_onehot = F.one_hot(
-                torch.tensor([action], device=device), num_classes=self.act_dim
-            ).float()
+            if self.is_discrete:
+                act_onehot = F.one_hot(
+                    torch.tensor([action], device=device), num_classes=self.act_dim
+                ).float()
+            else:
+                act_onehot = torch.tensor(action, device=device).float().unsqueeze(0)
             rnn_input = torch.cat([posterior_sample.detach(), act_onehot], dim=-1)
             _, self.h = self.world_model.rnn(rnn_input.unsqueeze(1), self.h)
 
