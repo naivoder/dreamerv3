@@ -14,23 +14,22 @@ def train_dreamer(config):
     env = park.make(config.env)
 
     obs_space = env.observation_space
-    is_image = isinstance(obs_space, gym.spaces.Box) and len(obs_space.shape) == 3
+    act_space = env.action_space
+    
+    is_discrete = isinstance(act_space, gym.spaces.Discrete) or isinstance(act_space, park.spaces.Discrete)
 
-    if is_image:
-        transform = transforms.Compose(
-            [
-                transforms.ToPILImage(),
-                transforms.Resize((64, 64)),
-                transforms.ToTensor(),
-            ]
-        )
-        obs_shape = (3, 64, 64)
-    else:
-        obs_shape = obs_space.shape
-        transform = None
+    transform = None
+    # Get the observation shape from the environment
+    obs = env.reset()
+    obs_shape = obs.shape if hasattr(obs, 'shape') else (len(obs),)
 
-    act_dim = env.action_space.n
-    agent = DreamerV3(obs_shape, act_dim, is_image, config)
+    # Print observation and action space information for debugging
+    print(f"Observation space: {obs_space}")
+    print(f"Observation shape: {obs_shape}")
+    print(f"Action space: {act_space}")
+
+    agent = DreamerV3(obs_shape, env.action_space, False, is_discrete, config)
+
     total_rewards = []
     world_losses = []
     actor_losses = []
@@ -42,12 +41,10 @@ def train_dreamer(config):
     best_weights = None
 
     with tqdm(total=config.episodes, desc=f"Training {config.env}", unit="episode") as pbar:
-        for episode in range(config.episodes):
+        for _ in range(config.episodes):
             obs = env.reset()
-            if is_image:
-                obs = transform(obs).numpy()
-            else:
-                obs = obs.astype(np.float32)
+            obs = np.array(obs).astype(np.float32)
+
             done = False
             episode_reward = 0
             agent.act(obs, reset=True)
@@ -55,15 +52,9 @@ def train_dreamer(config):
             while not done:
                 action = agent.act(obs)
                 next_obs, reward, done, _ = env.step(action)
-
-                if is_image:
-                    next_obs_processed = transform(next_obs).numpy()
-                    agent.store_transition(obs, action, reward, next_obs_processed, done)
-                    obs = next_obs_processed
-                else:
-                    next_obs = next_obs.astype(np.float32)
-                    agent.store_transition(obs, action, reward, next_obs, done)
-                    obs = next_obs
+                next_obs = np.array(next_obs).astype(np.float32)
+                agent.store_transition(obs, action, reward, next_obs, done)
+                obs = next_obs
 
                 episode_reward += reward
                 frame_idx += 1
