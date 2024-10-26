@@ -142,7 +142,8 @@ class DreamerV3:
         reward_loss = reward_loss.mean()
 
         # discount prediction loss
-        discount_target = (1.0 - done_seq.float()) * self.config.lambda_
+        discount_target = (1.0 - done_seq.float()) * self.config.gamma
+        pred_discount = torch.sigmoid(pred_discount)
         discount_loss = F.binary_cross_entropy(
             pred_discount, discount_target, reduction="none"
         )
@@ -228,13 +229,13 @@ class DreamerV3:
 
             # predict reward and discount
             decoder_input = torch.cat([imag_h.squeeze(0), imag_s], dim=-1)
-            pred_reward = self.world_model.reward_decoder(decoder_input)
-            pred_reward = pred_reward.squeeze(-1)
+            pred_reward = self.world_model.reward_decoder(decoder_input).squeeze(-1)
             imag_rewards.append(pred_reward)
 
-            pred_discount = self.world_model.discount_decoder(decoder_input)
-            pred_discount = pred_discount.squeeze(-1)
-            imag_discounts.append(pred_discount * self.config.lambda_)
+            pred_discount = self.world_model.discount_decoder(decoder_input).squeeze(-1)
+            pred_discount = torch.sigmoid(pred_discount)
+            pcont = pred_discount * self.config.gamma
+            imag_discounts.append(pcont)
 
         imag_states = torch.stack(
             imag_states
