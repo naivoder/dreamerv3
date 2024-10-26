@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import torch.nn.functional as F
-import gym
 
 from utils import gumbel_softmax, symlog, symexp, ObsNormalizer
 from networks import WorldModel, Actor, Critic
