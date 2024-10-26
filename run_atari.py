@@ -109,7 +109,7 @@ def create_animation(env_name, agent, seeds=100):
     agent.load_checkpoint()
     env = AtariEnv(
         env_name,
-        shape=(84, 84),
+        shape=(42, 42),
         repeat=4,
         clip_rewards=False,
     ).make()
@@ -146,22 +146,22 @@ if __name__ == "__main__":
     parser.add_argument("--latent_dim", type=int, default=32)
     parser.add_argument("--latent_categories", type=int, default=32)
     parser.add_argument("--hidden_dim", type=int, default=512)
-    parser.add_argument("--actor_lr", type=float, default=3e-5)
-    parser.add_argument("--critic_lr", type=float, default=1e-5)
-    parser.add_argument("--world_lr", type=float, default=1e-4)
+    parser.add_argument("--actor_lr", type=float, default=3e-4)
+    parser.add_argument("--critic_lr", type=float, default=3e-4)
+    parser.add_argument("--world_lr", type=float, default=3e-4)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--imagination_horizon", type=int, default=15)
     parser.add_argument("--free_nats", type=float, default=3.0)
     parser.add_argument("--batch_size", type=int, default=50)
     parser.add_argument("--seq_len", type=int, default=50)
-    parser.add_argument("--replay_buffer_capacity", type=int, default=10000)
+    parser.add_argument("--replay_buffer_capacity", type=int, default=100000)
     parser.add_argument("--entropy_scale", type=float, default=1e-3)
     parser.add_argument("--kl_balance_alpha", type=float, default=0.8)
     parser.add_argument("--lambda_", type=float, default=0.95)
     parser.add_argument("--max_grad_norm", type=float, default=100.0)
     parser.add_argument("--weight_decay", type=float, default=1e-6)
-    parser.add_argument("--num_updates", type=int, default=3)
-    parser.add_argument("--min_buffer_size", type=int, default=5000)
+    parser.add_argument("--num_updates", type=int, default=10)
+    parser.add_argument("--min_buffer_size", type=int, default=10000)
     parser.add_argument("--init_temperature", type=float, default=1.0)
     parser.add_argument("--temperature_decay", type=float, default=0.999)
     parser.add_argument("--min_temperature", type=float, default=0.5)
