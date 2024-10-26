@@ -22,7 +22,7 @@ def train_dreamer(args):
             args.env,
             shape=(42, 42),
             repeat=4,
-            clip_rewards=True,
+            clip_rewards=False,
         ).make()
 
     save_prefix = args.env.split("/")[-1]
