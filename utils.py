@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import imageio
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -96,3 +97,8 @@ class ReplayBuffer:
 
     def __len__(self):
         return self.size
+
+def save_animation(frames, filename):
+    with imageio.get_writer(filename, mode="I", loop=0) as writer:
+        for frame in frames:
+            writer.append_data(frame)

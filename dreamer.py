@@ -11,12 +11,12 @@ from networks import WorldModel, Actor, Critic
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class DreamerV3:
-    def __init__(self, obs_shape, act_space, is_image, is_discrete, config):
+    def __init__(self, obs_shape, act_space, is_image, is_discrete, config, env_name):
         self.config = config
         self.obs_shape = obs_shape
         self.is_image = is_image
         self.is_discrete = is_discrete
-        print("Is Discrete: ", self.is_discrete)
+        self.env_name = env_name
         
         if self.is_discrete:
             self.act_dim = act_space.n
@@ -383,3 +383,14 @@ class DreamerV3:
             'actor_loss': np.mean(actor_losses),
             'critic_loss': np.mean(critic_losses)
         }
+    
+    def save_checkpoint(self):
+        torch.save(self.world_model.state_dict(), f"weights/{self.env_name}_world_model.pt")
+        torch.save(self.actor.state_dict(), f"weights/{self.env_name}_actor.pt")
+        torch.save(self.critic.state_dict(), f"weights/{self.env_name}_critic.pt")
+
+
+    def load_checkpoint(self):
+        self.world_model.load_state_dict(torch.load(f"weights/{self.env_name}_world_model.pt"))
+        self.actor.load_state_dict(torch.load(f"weights/{self.env_name}_actor.pt"))
+        self.critic.load_state_dict(torch.load(f"weights/{self.env_name}_critic.pt"))
