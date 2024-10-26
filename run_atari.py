@@ -15,6 +15,7 @@ ALEInterface.setLoggerMode(LoggerMode.Error)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
 def train_dreamer(args):
     def make_env():
         return AtariEnv(
@@ -36,38 +37,46 @@ def train_dreamer(args):
 
     agent = DreamerV3(obs_shape, act_dim, is_image, True, args)
     world_losses, actor_losses, critic_losses = [], [], []
-    best_avg_reward, frame_idx, avg_reward_window = float('-inf'), 0, 100
+    best_avg_reward, frame_idx, avg_reward_window = float("-inf"), 0, 100
     score = np.zeros(args.n_envs)
     history = []
     states, _ = envs.reset()
-    
+    done = np.zeros(args.n_envs, dtype=bool)
+
     while len(history) < args.episodes:
-        actions = [agent.act(state) for state in states]
+        actions = [
+            agent.act(state, env_id=j, reset=done[j]) for j, state in enumerate(states)
+        ]
 
         next_states, rewards, term, trunc, _ = envs.step(actions)
         done = np.logical_or(term, trunc)
-        
+
         for j in range(args.n_envs):
-            agent.store_transition(states[j], actions[j], rewards[j], next_states[j], done[j])
+            agent.store_transition(
+                j, states[j], actions[j], rewards[j], next_states[j], done[j]
+            )
             score[j] += rewards[j]
             if done[j]:
                 history.append(score[j])
                 score[j] = 0
-   
-        # states = np.where(done[:, None], envs.reset()[0], next_states)
-        states = next_states 
+                agent.reset_hidden_states(env_id=j)
 
-        if len(agent.replay_buffer) > args.min_buffer_size and frame_idx % args.train_horizon == 0:
+        states = next_states
+
+        if (
+            len(agent.replay_buffer) > args.min_buffer_size
+            and frame_idx % args.train_horizon == 0
+        ):
             losses = agent.train(num_updates=args.num_updates)
             if losses:
-                world_losses.append(losses['world_loss'])
-                actor_losses.append(losses['actor_loss'])
-                critic_losses.append(losses['critic_loss'])
+                world_losses.append(losses["world_loss"])
+                actor_losses.append(losses["actor_loss"])
+                critic_losses.append(losses["critic_loss"])
 
         frame_idx += args.n_envs
         if len(history) > 0:
             avg_score = np.mean(history[-avg_reward_window:])
-        
+
             if avg_score > best_avg_reward:
                 best_avg_reward = avg_score
                 agent.save_checkpoint()
@@ -76,34 +85,41 @@ def train_dreamer(args):
             avg_str = f"  Avg.Score = {avg_score:.2f}"
             print(ep_str + avg_str, end="\r")
 
-    torch.save(agent.world_model.state_dict(), f"weights/{save_prefix}_world_model_final.pth")
+    torch.save(
+        agent.world_model.state_dict(), f"weights/{save_prefix}_world_model_final.pth"
+    )
     torch.save(agent.actor.state_dict(), f"weights/{save_prefix}_actor_final.pth")
     torch.save(agent.critic.state_dict(), f"weights/{save_prefix}_critic_final.pth")
 
     plot_results(history, world_losses, actor_losses, critic_losses, save_prefix)
     create_animation(args.env, agent)
 
+
 def plot_results(rewards, world_losses, actor_losses, critic_losses, save_prefix):
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 12))
 
-    ax1.plot(rewards, label='Episode Reward')
-    ax1.plot(np.convolve(rewards, np.ones(100)/100, mode='valid'), label='Running Average (100 episodes)')
-    ax1.set_xlabel('Episode')
-    ax1.set_ylabel('Reward')
-    ax1.set_title('Rewards over Episodes')
+    ax1.plot(rewards, label="Episode Reward")
+    ax1.plot(
+        np.convolve(rewards, np.ones(100) / 100, mode="valid"),
+        label="Running Average (100 episodes)",
+    )
+    ax1.set_xlabel("Episode")
+    ax1.set_ylabel("Reward")
+    ax1.set_title("Rewards over Episodes")
     ax1.legend()
 
-    ax2.plot(world_losses, label='World Model Loss')
-    ax2.plot(actor_losses, label='Actor Loss')
-    ax2.plot(critic_losses, label='Critic Loss')
-    ax2.set_xlabel('Update Step')
-    ax2.set_ylabel('Loss')
-    ax2.set_title('Losses over Update Steps')
+    ax2.plot(world_losses, label="World Model Loss")
+    ax2.plot(actor_losses, label="Actor Loss")
+    ax2.plot(critic_losses, label="Critic Loss")
+    ax2.set_xlabel("Update Step")
+    ax2.set_ylabel("Loss")
+    ax2.set_title("Losses over Update Steps")
     ax2.legend()
 
     plt.tight_layout()
-    plt.savefig(f'results/{save_prefix}.png')
+    plt.savefig(f"results/{save_prefix}.png")
     plt.close()
+
 
 def create_animation(env_name, agent, seeds=100):
     agent.load_checkpoint()
@@ -136,8 +152,10 @@ def create_animation(env_name, agent, seeds=100):
 
     utils.save_animation(best_frames, f"environments/{save_prefix}.gif")
 
+
 if __name__ == "__main__":
     import argparse
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", type=str)
     parser.add_argument("--n_envs", type=int, default=32)
