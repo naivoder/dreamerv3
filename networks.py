@@ -7,15 +7,15 @@ from utils import gumbel_softmax
 class ConvEncoder(nn.Module):
     def __init__(self, obs_shape, config):
         super(ConvEncoder, self).__init__()
-        c, h, w = obs_shape
+        c, h, w = obs_shape  
         self.conv_net = nn.Sequential(
-            nn.Conv2d(c, 32, kernel_size=4, stride=2, padding=1),  # Output: (32, h/2, w/2)
+            nn.Conv2d(c, 32, kernel_size=4, stride=2, padding=1), 
             nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1),  # Output: (64, h/4, w/4)
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1), 
             nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),  # Output: (128, h/8, w/8)
+            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1), 
             nn.ReLU(),
-            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),  # Output: (256, h/16, w/16)
+            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),
             nn.ReLU(),
             nn.Flatten(),
             nn.Linear(256 * (h // 16) * (w // 16), config.hidden_dim),
@@ -23,30 +23,31 @@ class ConvEncoder(nn.Module):
         )
 
     def forward(self, obs):
-        obs = obs / 255.0  # Normalize pixel values
+        obs = obs / 255.0  
         return self.conv_net(obs)
-
-
-# Convolutional Decoder for Reconstructing Image Observations
+    
 class ConvDecoder(nn.Module):
     def __init__(self, obs_shape, config):
         super(ConvDecoder, self).__init__()
         self.obs_shape = obs_shape
         c, h, w = obs_shape
+
         self.fc = nn.Sequential(
             nn.Linear(config.hidden_dim + config.latent_dim * config.latent_categories,
                       256 * (h // 16) * (w // 16)),
             nn.ReLU(),
         )
         self.deconv_net = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),  # Output: (128, h/8, w/8)
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
             nn.ReLU(),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),  # Output: (64, h/4, w/4)
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
             nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),  # Output: (32, h/2, w/2)
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
             nn.ReLU(),
-            nn.ConvTranspose2d(32, c, kernel_size=4, stride=2, padding=1),  # Output: (c, h, w)
-            nn.Sigmoid(),  # Output pixel values between 0 and 1
+            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(16, c, kernel_size=11, stride=1, padding=0), 
+            nn.Sigmoid(),
         )
 
     def forward(self, x):
@@ -57,13 +58,13 @@ class ConvDecoder(nn.Module):
         return self.deconv_net(x)
 
 
-# MLP Encoder for Vector Observations
+
 class MLPEncoder(nn.Module):
     def __init__(self, obs_dim, config):
         super(MLPEncoder, self).__init__()
         self.net = nn.Sequential(
-            nn.Flatten(),  # Add this line to flatten the input
-            nn.LayerNorm(np.prod(obs_dim)),  # Use np.prod to handle multi-dimensional inputs
+            nn.Flatten(),  
+            nn.LayerNorm(np.prod(obs_dim)), 
             nn.Linear(np.prod(obs_dim), config.hidden_dim),
             nn.ReLU(),
             nn.Linear(config.hidden_dim, config.hidden_dim),
@@ -74,7 +75,6 @@ class MLPEncoder(nn.Module):
         return self.net(obs)
 
 
-# MLP Decoder for Reconstructing Vector Observations
 class MLPDecoder(nn.Module):
     def __init__(self, obs_dim, config):
         super(MLPDecoder, self).__init__()
@@ -88,7 +88,6 @@ class MLPDecoder(nn.Module):
         return self.net(x)
 
 
-# World Model with Discrete Latent Representations and KL Balancing
 class WorldModel(nn.Module):
     def __init__(self, obs_shape, act_dim, is_image, is_discrete, config):
         super(WorldModel, self).__init__()
@@ -128,7 +127,7 @@ class WorldModel(nn.Module):
             nn.Linear(config.hidden_dim + config.latent_dim * config.latent_categories, config.hidden_dim),
             nn.ReLU(),
             nn.Linear(config.hidden_dim, 1),
-            nn.Sigmoid(),  # Output between 0 and 1
+            nn.Sigmoid(), 
         )
 
     def forward(self, obs_seq, act_seq, tau):

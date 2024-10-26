@@ -11,17 +11,13 @@ from networks import WorldModel, Actor, Critic
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class DreamerV3:
-    def __init__(self, obs_shape, act_space, is_image, is_discrete, config, env_name):
+    def __init__(self, obs_shape, act_dim, is_image, is_discrete, config):
         self.config = config
         self.obs_shape = obs_shape
         self.is_image = is_image
         self.is_discrete = is_discrete
-        self.env_name = env_name
-        
-        if self.is_discrete:
-            self.act_dim = act_space.n
-        else:
-            self.act_dim = act_space.shape[0]
+        self.env_name = config.env
+        self.act_dim = act_dim
 
         self.world_model = WorldModel(obs_shape, self.act_dim, is_image, is_discrete, config).to(device)
         self.actor = Actor(config.hidden_dim, self.act_dim, self.is_discrete, config).to(device)
@@ -61,7 +57,6 @@ class DreamerV3:
             self.obs_normalizer = ObsNormalizer(obs_shape)
 
     def init_weights(self, m):
-
         if isinstance(m, nn.Linear):
             in_num = m.in_features
             out_num = m.out_features
@@ -73,6 +68,7 @@ class DreamerV3:
             )
             if hasattr(m.bias, "data"):
                 m.bias.data.fill_(0.0)
+
         elif isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
             space = m.kernel_size[0] * m.kernel_size[1]
             in_num = space * m.in_channels
@@ -109,26 +105,26 @@ class DreamerV3:
         pred_discount = outputs["pred_discount"]
         kl_loss = outputs["kl_loss"]
 
-        # Reconstruction loss
+        # reconstruction loss
         if self.is_image:
             recon_loss = F.mse_loss(recon_obs, obs_seq, reduction='none')
-            recon_loss = recon_loss.mean(dim=[2, 3, 4])  # Mean over image dimensions
+            recon_loss = recon_loss.mean(dim=[2, 3, 4])  # mean over image dimensions
         else:
             recon_loss = F.mse_loss(recon_obs, obs_seq, reduction='none')
-            recon_loss = recon_loss.mean(dim=2)  # Mean over observation dimensions
+            recon_loss = recon_loss.mean(dim=2)  # mean over observation dimensions
 
-        recon_loss = recon_loss.mean()  # Mean over batch and sequence length
+        recon_loss = recon_loss.mean()  # mean over batch and sequence length
 
-        # Reward prediction loss
+        # reward prediction loss
         reward_loss = F.mse_loss(pred_reward, symlog(rew_seq), reduction='none')
         reward_loss = reward_loss.mean()
 
-        # Discount prediction loss
+        # discount prediction loss
         discount_target = (1.0 - done_seq.float()) * self.config.lambda_
         discount_loss = F.binary_cross_entropy(pred_discount, discount_target, reduction='none')
         discount_loss = discount_loss.mean()
 
-        # Total loss
+        # total loss
         loss_world = recon_loss + reward_loss + discount_loss + self.config.kl_scale * kl_loss
 
         self.world_optimizer.zero_grad()
@@ -139,22 +135,19 @@ class DreamerV3:
         return loss_world.item()
 
     def update_actor_and_critic(self):
-        # Imagined rollouts
+        # imagined rollouts
         try:
             batch = self.replay_buffer.sample_batch(self.config.batch_size, 1)
         except ValueError:
-            return  # Not enough data to train
+            return  
 
         obs_seq, act_seq, _, _, _ = batch
         obs = obs_seq[:, 0]
 
-        # Encode observation
         obs_encoded = self.world_model.obs_encoder(obs)
-
-        # Initialize hidden state
         imag_h = torch.zeros(1, self.config.batch_size, self.config.hidden_dim, device=device)
 
-        # Compute initial posterior state
+        # initial posterior state
         posterior_input = torch.cat([imag_h.squeeze(0), obs_encoded], dim=-1)
         posterior_logits = self.world_model.posterior_net(posterior_input)
         posterior_logits = posterior_logits.view(
@@ -170,7 +163,7 @@ class DreamerV3:
         for _ in range(self.config.imagination_horizon):
             imag_states.append(imag_h.squeeze(0))
 
-            # Get action probabilities from actor
+            # action probabilities from actor
             action_probs = self.actor(imag_h.squeeze(0))
             if self.is_discrete:
                 action_dist = torch.distributions.Categorical(probs=action_probs)
@@ -182,7 +175,7 @@ class DreamerV3:
                 imag_action = action_dist.sample()
                 imag_action_log_probs.append(action_dist.log_prob(imag_action))
 
-            # Update imag_h and imag_s using the world model
+            # update hidden state
             if self.is_discrete:
                 act_onehot = F.one_hot(imag_action, num_classes=self.act_dim).float()
             else:
@@ -190,17 +183,16 @@ class DreamerV3:
             rnn_input = torch.cat([imag_s, act_onehot], dim=-1)
             rnn_input = rnn_input.unsqueeze(1)  # Shape: [batch_size, 1, input_size]
 
-            # RNN step
             _, imag_h = self.world_model.rnn(rnn_input, imag_h)
 
-            # Compute prior logits and sample imag_s
+            # compute prior logits and sample imag_s
             prior_logits = self.world_model.prior_net(imag_h.squeeze(0))
             prior_logits = prior_logits.view(
                 self.config.batch_size, self.config.latent_dim, self.config.latent_categories
             )
             imag_s = gumbel_softmax(prior_logits, tau=self.temperature, hard=False).view(self.config.batch_size, -1)
 
-            # Predict reward and discount
+            # predict reward and discount
             decoder_input = torch.cat([imag_h.squeeze(0), imag_s], dim=-1)
             pred_reward = self.world_model.reward_decoder(decoder_input)
             pred_reward = pred_reward.squeeze(-1)
@@ -210,23 +202,21 @@ class DreamerV3:
             pred_discount = pred_discount.squeeze(-1)
             imag_discounts.append(pred_discount * self.config.lambda_)
 
-        # Convert lists to tensors
         imag_states = torch.stack(imag_states)  # Shape: [imagination_horizon, batch_size, hidden_dim]
         imag_rewards = torch.stack(imag_rewards)  # Shape: [imagination_horizon, batch_size]
         imag_discounts = torch.stack(imag_discounts)  # Shape: [imagination_horizon, batch_size]
         imag_action_log_probs = torch.stack(imag_action_log_probs)  # Shape: [imagination_horizon, batch_size]
 
-        # Reshape imag_states for critic input
         imag_states_flat = imag_states.view(-1, self.config.hidden_dim)
 
-        # Get value estimates for critic update (detach to prevent backprop through the world model)
+        # value prediction
         value_pred = self.critic(imag_states_flat.detach()).view(self.config.imagination_horizon, self.config.batch_size)
         self.q_values = value_pred[0, :].detach().cpu().numpy()  # Save for logging
 
-        # Bootstrap value is the last value prediction
+        # bootstrap value
         bootstrap = value_pred[-1]
 
-        # Compute lambda returns
+        # lambda return
         lambda_returns = self.lambda_return(
             reward=imag_rewards,
             value=value_pred,
@@ -237,7 +227,7 @@ class DreamerV3:
 
         self.returns = lambda_returns[0, :].detach().cpu().numpy()  # Save for logging
 
-        # Critic update
+        # critic update
         value_target = lambda_returns.detach()
         critic_loss = F.mse_loss(value_pred, value_target)
 
@@ -246,13 +236,13 @@ class DreamerV3:
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.config.max_grad_norm)
         self.critic_optimizer.step()
 
-        # Actor update
-        # Recompute value estimates without detaching imag_states to allow gradients to flow
+        # actor update
+        # recompute value estimates without detaching imag_states to allow gradients to flow
         value_pred_actor = self.critic(imag_states_flat).view(self.config.imagination_horizon, self.config.batch_size)
         advantage = (lambda_returns.detach() - value_pred_actor)
         actor_loss = -(advantage * imag_action_log_probs).mean()
 
-        # Entropy regularization
+        # entropy regularization
         action_probs = self.actor(imag_states_flat)
         if self.is_discrete:
             action_probs = action_probs.view(self.config.imagination_horizon, self.config.batch_size, -1)
@@ -269,7 +259,7 @@ class DreamerV3:
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.config.max_grad_norm)
         self.actor_optimizer.step()
 
-        # Update target critic using soft update
+        # update target critic 
         self._soft_update(self.target_critic, self.critic)
 
         return actor_loss.item(), critic_loss.item()
@@ -311,10 +301,9 @@ class DreamerV3:
             obs = torch.tensor(obs).float().to(device).unsqueeze(0)
 
         with torch.no_grad():
-            # Encode observation
             obs_encoded = self.world_model.obs_encoder(obs)
 
-            # Compute posterior over latent variables
+            # posterior over latent variables
             h = self.h.squeeze(0)  # Shape: [1, hidden_dim]
             
             posterior_input = torch.cat([h, obs_encoded], dim=-1)
@@ -324,7 +313,7 @@ class DreamerV3:
             )
             posterior_sample = gumbel_softmax(posterior_logits, tau=self.temperature, hard=False).view(1, -1)
 
-            # Get action probabilities from actor
+            # action probabilities from actor
             action_probs = self.actor(h)
             if self.is_discrete:
                 action_dist = torch.distributions.Categorical(probs=action_probs)
@@ -334,7 +323,7 @@ class DreamerV3:
                 action_dist = torch.distributions.Normal(action_mean, action_std)
                 action = action_dist.sample().cpu().numpy()
 
-            # Update hidden state
+            # update hidden state
             if self.is_discrete:
                 act_onehot = F.one_hot(
                     torch.tensor([action], device=device), num_classes=self.act_dim
@@ -362,21 +351,21 @@ class DreamerV3:
         for _ in range(num_updates):
             world_loss = self.update_world_model()
             if world_loss is None:
-                continue  # Not enough data to train
+                continue  
             losses = self.update_actor_and_critic()
             if losses is None:
-                continue  # Not enough data to train
+                continue 
             actor_loss, critic_loss = losses
 
             world_losses.append(world_loss)
             actor_losses.append(actor_loss)
             critic_losses.append(critic_loss)
 
-            # Anneal temperature
+            # anneal temperature
             self.temperature = max(self.temperature * self.config.temperature_decay, self.config.min_temperature)
 
         if len(world_losses) == 0:
-            return None  # Not enough data to train
+            return None 
 
         return {
             'world_loss': np.mean(world_losses),

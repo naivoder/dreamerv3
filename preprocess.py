@@ -94,7 +94,7 @@ class AtariEnv:
     def __init__(
         self,
         env,
-        shape=(84, 84),
+        shape=(42, 42),
         repeat=4,
         clip_rewards=False,
         no_ops=0,

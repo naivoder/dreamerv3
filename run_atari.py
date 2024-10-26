@@ -19,7 +19,7 @@ def train_dreamer(args):
     def make_env():
         return AtariEnv(
             args.env,
-            shape=(84, 84),
+            shape=(42, 42),
             repeat=4,
             clip_rewards=True,
         ).make()
@@ -41,7 +41,7 @@ def train_dreamer(args):
     history = []
     states, _ = envs.reset()
     
-    while frame_idx < args.episodes * args.n_envs:
+    while len(history) < args.episodes:
         actions = [agent.act(state) for state in states]
 
         next_states, rewards, term, trunc, _ = envs.step(actions)
@@ -68,20 +68,18 @@ def train_dreamer(args):
         if len(history) > 0:
             avg_score = np.mean(history[-avg_reward_window:])
         
-        if avg_score > best_avg_reward:
-            best_avg_reward = avg_score
-            agent.save_checkpoint()
+            if avg_score > best_avg_reward:
+                best_avg_reward = avg_score
+                agent.save_checkpoint()
 
-        ep_str = f"[Episode {len(history):05}/{args.episodes}]"
-        avg_str = f"  Avg.Score = {avg_score:.2f}"
-        print(ep_str + avg_str, end="\r")
+            ep_str = f"[Episode {len(history):05}/{args.episodes}]"
+            avg_str = f"  Avg.Score = {avg_score:.2f}"
+            print(ep_str + avg_str, end="\r")
 
-    # Save final model
     torch.save(agent.world_model.state_dict(), f"weights/{save_prefix}_world_model_final.pth")
     torch.save(agent.actor.state_dict(), f"weights/{save_prefix}_actor_final.pth")
     torch.save(agent.critic.state_dict(), f"weights/{save_prefix}_critic_final.pth")
 
-    # Plot and save results
     plot_results(history, world_losses, actor_losses, critic_losses, save_prefix)
     create_animation(args.env, agent)
 
@@ -141,7 +139,8 @@ def create_animation(env_name, agent, seeds=100):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--env", type=str, default="CartPole-v1")
+    parser.add_argument("--env", type=str)
+    parser.add_argument("--n_envs", type=int, default=32)
     parser.add_argument("--episodes", type=int, default=100000)
     parser.add_argument("--train_horizon", type=int, default=1000)
     parser.add_argument("--latent_dim", type=int, default=32)
