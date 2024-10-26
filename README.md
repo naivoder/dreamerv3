@@ -4,9 +4,6 @@
 
 This repository contains a PyTorch implementation of the DreamerV3 algorithm, aimed at providing a more readable and understandable version compared to the official implementations. It serves as an opportunity to learn and explore the intricacies of the DreamerV3 algorithm while maintaining clarity and simplicity.
 
-Learning curves are starting to look better!
-![dreamer_results](dreamer_results.png)
-
 ## Overview
 
 DreamerV3 is a state-of-the-art model-based reinforcement learning algorithm that learns a world model from experiences and uses it to train an actor-critic policy from imagined trajectories. The algorithm consists of several key components:
@@ -37,17 +34,25 @@ To set up the environment and install the required dependencies, follow these st
 
 ## Running the Code
 
-To run the DreamerV3 algorithm, use the following command:
+To run the DreamerV3 algorithm on the atari environments, use the following command:
 
 ```bash
-python dreamer.py
+python run_atari.py
 ```
+
+I've also been messing around with the Park OS environments, which you can run with:
+
+```bash
+python run_park.py
+```
+
+Although, tbh, I've been incredibly lazy about making sure it works for both, so at any given time you should fully expect that I've broken one or the other... I promise I'll fix it up one day (🤞)
 
 ### Command-line Arguments
 
 The script supports various command-line arguments to customize the training process. Some key options include:
 
-- `--env`: Specify the environment (default: "CartPole-v1")
+- `--env`: Specify the environment
 - `--episodes`: Number of episodes to train (default: 10000)
 - `--latent_dim`: Dimension of latent space (default: 32)
 - `--hidden_dim`: Hidden dimension size (default: 512)
