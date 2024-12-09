@@ -333,22 +333,13 @@ class WorldModel(nn.Module):
         (prior, posterior), state = self.rssm(prev_state, prev_action, encoded_obs)
         return (prior, posterior), state
 
-    def generate_sequence(
-        self,
-        initial_features,
-        actor,
-        actions=None,
-    ):
+    def generate_sequence(self, initial_features, actor, actions=None):
         features = self.rssm.imagine(initial_features, actor, actions)
         reward_dist = self.reward(features)  # Normal distribution
         terminal_dist = self.terminal(features)  # Bernoulli distribution
         return features, reward_dist, terminal_dist
 
-    def observe_sequence(
-        self,
-        observations,
-        actions,
-    ):
+    def observe_sequence(self, observations, actions):
         encoded_obs = self.encoder(observations)
         (prior, posterior), features = self.rssm.observe(encoded_obs, actions)
         reward_dist = self.reward(features)  # Normal distribution
@@ -381,9 +372,7 @@ class Actor(nn.Module):
             self.final_out = self.action_dim
 
         self.hidden_sizes = [400, 400, 400, 400]
-        self.init_network()
 
-    def init_network(self):
         layers = []
         prev_dim = self.input_dim
         for size in self.hidden_sizes:
