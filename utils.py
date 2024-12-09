@@ -5,6 +5,16 @@ import imageio
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def preprocess(image):
+    # Preprocess raw images by normalizing pixel values from [0, 255] to [-0.5, 0.5].
+    return image / 255.0 - 0.5
+
+
+def quantize(image):
+    # Inverse of preprocess: map [-0.5, 0.5] back to [0, 255] as uint8.
+    return ((image + 0.5) * 255).astype(np.uint8)
+
+
 class ObsNormalizer:
     def __init__(self, shape, eps=1e-8):
         self.mean = np.zeros(shape, dtype=np.float32)

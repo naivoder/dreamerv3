@@ -119,9 +119,9 @@ class DreamerV3:
             self.config.batch_size, self.config.seq_len
         )
 
-        obs_seq, act_seq, rew_seq, next_obs_seq, done_seq = batch
+        obs, act, rew, next_obs, done = batch
 
-        outputs = self.world_model(obs_seq, act_seq, tau=self.temperature)
+        outputs = self.world_model(obs, act, tau=self.temperature)
         recon_obs = outputs["recon_obs"]
         pred_reward = outputs["pred_reward"]
         pred_discount = outputs["pred_discount"]
@@ -129,20 +129,20 @@ class DreamerV3:
 
         # reconstruction loss
         if self.is_image:
-            recon_loss = F.mse_loss(recon_obs, obs_seq, reduction="none")
+            recon_loss = F.mse_loss(recon_obs, obs, reduction="none")
             recon_loss = recon_loss.mean(dim=[2, 3, 4])  # mean over image dimensions
         else:
-            recon_loss = F.mse_loss(recon_obs, obs_seq, reduction="none")
+            recon_loss = F.mse_loss(recon_obs, obs, reduction="none")
             recon_loss = recon_loss.mean(dim=2)  # mean over observation dimensions
 
         recon_loss = recon_loss.mean()  # mean over batch and sequence length
 
         # reward prediction loss
-        reward_loss = F.mse_loss(pred_reward, symlog(rew_seq), reduction="none")
+        reward_loss = F.mse_loss(pred_reward, symlog(rew), reduction="none")
         reward_loss = reward_loss.mean()
 
         # discount prediction loss
-        discount_target = (1.0 - done_seq.float()) * self.config.gamma
+        discount_target = (1.0 - done.float()) * self.config.gamma
         pred_discount = torch.sigmoid(pred_discount)
         discount_loss = F.binary_cross_entropy(
             pred_discount, discount_target, reduction="none"
@@ -369,7 +369,7 @@ class DreamerV3:
             ).view(1, -1)
 
             # action probabilities from actor
-            action_probs = self.actor(h)
+            action_probs = self.actor(obs_encoded)
             if self.is_discrete:
                 action_dist = torch.distributions.Categorical(probs=action_probs)
                 action = action_dist.sample().cpu().numpy()[0]
