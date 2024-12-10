@@ -222,6 +222,12 @@ class Dreamer:
         torch.save(self.critic.state_dict(), f"{self.path}_critic.pt")
 
     def load_checkpoint(self):
-        self.world_model.load_state_dict(torch.load(f"{self.path}_world_model.pt"))
-        self.actor.load_state_dict(torch.load(f"{self.path}_actor.pt"))
-        self.critic.load_state_dict(torch.load(f"{self.path}_critic.pt"))
+        self.world_model.load_state_dict(
+            torch.load(f"{self.path}_world_model.pt", weights_only=True)
+        )
+        self.actor.load_state_dict(
+            torch.load(f"{self.path}_actor.pt", weights_only=True)
+        )
+        self.critic.load_state_dict(
+            torch.load(f"{self.path}_critic.pt", weights_only=True)
+        )
