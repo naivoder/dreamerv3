@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import os
 import warnings
 from ale_py import ALEInterface, LoggerMode
-from config import environments
+from envs import environments
 from preprocess import AtariEnv
 from dreamer import DreamerV3
 import utils

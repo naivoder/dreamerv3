@@ -4,10 +4,10 @@ import utils
 
 
 class ReplayBuffer:
-    def __init__(self, capacity, batch_size, seq_length, device):
-        self.capacity = capacity
-        self.batch_size = batch_size
-        self.seq_length = seq_length
+    def __init__(self, config, device):
+        self.capacity = config.capacity
+        self.batch_size = config.batch_size
+        self.seq_length = config.seq_length
         self.device = device
 
         self.episodes = []

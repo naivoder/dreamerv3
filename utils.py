@@ -15,6 +15,57 @@ def quantize(image):
     return ((image + 0.5) * 255).astype(np.uint8)
 
 
+def compute_lambda_values(
+    next_values,
+    rewards,
+    terminals,
+    discount,
+    lambda_,
+):
+    """
+    # Compute lambda-returns for imagined trajectories:
+    # The lambda-returns combine bootstrap values with multi-step returns,
+    # providing a trade-off between bias and variance.
+    #
+    # next_values: Value estimates for each step (including the last bootstrap).
+    # rewards: Immediate rewards at each step.
+    # terminals: Terminal signals (1 if episode ends).
+    # discount: Discount factor for future rewards.
+    # lambda_: Parameter controlling the weighting between 1-step returns and bootstrap values.
+    """
+    # Initialize the lambda-returns with the bootstrap value.
+    v_lambda = next_values[:, -1] * (1.0 - terminals[:, -1])
+    horizon = next_values.shape[1]
+    lambda_values = np.empty_like(next_values)
+
+    for t in reversed(range(horizon)):
+        td = (
+            rewards[:, t]
+            + (1.0 - terminals[:, t]) * (1.0 - lambda_) * discount * next_values[:, t]
+        )
+        v_lambda = td + v_lambda * lambda_ * discount
+        lambda_values = lambda_values.at[:, t].set(v_lambda)
+    return lambda_values
+
+
+def global_norm(grads):
+    """
+    Compute the global L2 norm of a set of gradients in PyTorch.
+
+    Args:
+        grads (iterable): An iterable of gradient tensors.
+
+    Returns:
+        float: The global L2 norm.
+    """
+    total_norm = 0.0
+    for grad in grads:
+        if grad is not None:  # Skip parameters with no gradient
+            param_norm = grad.data.norm(2)
+            total_norm += param_norm.item() ** 2
+    return total_norm**0.5
+
+
 class ObsNormalizer:
     def __init__(self, shape, eps=1e-8):
         self.mean = np.zeros(shape, dtype=np.float32)
