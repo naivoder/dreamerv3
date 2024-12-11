@@ -18,16 +18,18 @@ class Dreamer:
         self.config = config
         self.path = f"weights/{config.task}"
 
-        self.world_model = networks.WorldModel(obs_shape, config).to(self.device)
-        self.actor = networks.Actor(act_space, config).to(self.device)
-        self.critic = networks.Critic(config).to(self.device)
-
-        self.memory = ReplayBuffer(config, self.device)
-        self.logger = TrainingLogger(config)
-
         self.act_shape = act_space.shape
         self.act_low, self.act_high = act_space.low, act_space.high
         self.random_action = lambda: act_space.sample()
+
+        self.world_model = networks.WorldModel(obs_shape, act_space, config).to(
+            self.device
+        )
+        self.actor = networks.Actor(act_space, config).to(self.device)
+        self.critic = networks.Critic(config).to(self.device)
+
+        self.memory = ReplayBuffer(config.replay, self.device)
+        self.logger = TrainingLogger(config)
 
         self.state = self.init_state()
         self.step = 0
@@ -56,7 +58,8 @@ class Dreamer:
         return (stoch, det), action
 
     def act(self, prev_state, prev_action, obs, training=True):
-        obs = torch.tensor(obs, dtype=torch.float32).unsqueeze(0).to(self.device)
+        # Add batch and time dimensions to single observation
+        obs = obs.unsqueeze(0).unsqueeze(0)
 
         # Process observation to get latent state
         _, current_state = self.world_model(prev_state, prev_action, obs)

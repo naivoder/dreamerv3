@@ -23,15 +23,15 @@ def compute_lambda_values(
     lambda_,
 ):
     """
-    # Compute lambda-returns for imagined trajectories:
-    # The lambda-returns combine bootstrap values with multi-step returns,
-    # providing a trade-off between bias and variance.
-    #
-    # next_values: Value estimates for each step (including the last bootstrap).
-    # rewards: Immediate rewards at each step.
-    # terminals: Terminal signals (1 if episode ends).
-    # discount: Discount factor for future rewards.
-    # lambda_: Parameter controlling the weighting between 1-step returns and bootstrap values.
+    Compute lambda-returns for imagined trajectories:
+    The lambda-returns combine bootstrap values with multi-step returns,
+    providing a trade-off between bias and variance.
+
+    next_values: Value estimates for each step (including the last bootstrap).
+    rewards: Immediate rewards at each step.
+    terminals: Terminal signals (1 if episode ends).
+    discount: Discount factor for future rewards.
+    lambda_: Parameter controlling the weighting between 1-step returns and bootstrap values.
     """
     # Initialize the lambda-returns with the bootstrap value.
     v_lambda = next_values[:, -1] * (1.0 - terminals[:, -1])
@@ -46,6 +46,14 @@ def compute_lambda_values(
         v_lambda = td + v_lambda * lambda_ * discount
         lambda_values = lambda_values.at[:, t].set(v_lambda)
     return lambda_values
+
+
+def discount(factor, length):
+    # Create a discount array for a given horizon length.
+    # This is used to scale rewards over multiple steps.
+    d = np.cumprod(factor * np.ones((length - 1,)))
+    d = np.concatenate([np.ones((1,)), d])
+    return d
 
 
 def global_norm(grads):

@@ -7,7 +7,7 @@ import warnings
 from ale_py import ALEInterface, LoggerMode
 from envs import environments
 from preprocess import AtariEnv
-from dreamer import DreamerV3
+from dreamer import Dreamer
 import utils
 
 warnings.simplefilter("ignore")
@@ -17,25 +17,21 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def train_dreamer(args):
-    def make_env():
-        return AtariEnv(
-            args.env,
-            shape=(42, 42),
-            repeat=4,
-            clip_rewards=False,
-        ).make()
-
     save_prefix = args.env.split("/")[-1]
-    envs = gym.vector.AsyncVectorEnv([make_env for _ in range(args.n_envs)])
-    obs_shape = envs.single_observation_space.shape
-    act_dim = envs.single_action_space.n
-    is_image = len(obs_shape) == 3
+    env = AtariEnv(
+        args.env,
+        shape=(64, 64),
+        repeat=4,
+        clip_rewards=False,
+    ).make()
+    obs_shape = env.observation_space.shape
+    act_space = env.action_space
 
     print(f"\nEnvironment: {save_prefix}")
-    print(f"Obs.Space: {envs.single_observation_space.shape}")
-    print(f"Act.Space: {envs.single_action_space.n}")
+    print(f"Obs.Shape: {obs_shape}")
+    print(f"Act.Space: {act_space}")
 
-    agent = DreamerV3(obs_shape, act_dim, is_image, True, args)
+    agent = Dreamer(obs_shape, act_space, args)
     world_losses, actor_losses, critic_losses = [], [], []
     best_avg_reward, frame_idx, avg_reward_window = float("-inf"), 0, 100
     score = np.zeros(args.n_envs)

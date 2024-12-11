@@ -28,9 +28,9 @@ class ObservationEncoder(nn.Module):
             c_in = c_out
         self.convs = nn.ModuleList(conv_layers)
 
-    def forward(self, observation: torch.Tensor) -> torch.Tensor:
-        # observation: [B,T,H,W,C]
-        B, T, C, H, W = observation.shape
+    def forward(self, x):
+        print(x.shape)
+        B, T, C, H, W = x.shape
         x = x.view(B * T, C, H, W)
 
         for conv in self.convs:
@@ -41,49 +41,47 @@ class ObservationEncoder(nn.Module):
 
 
 class ObservationDecoder(nn.Module):
-    def __init__(
-        self,
-        output_shape,
-        config,
-    ):
+    def __init__(self, output_shape, config):
         super(ObservationDecoder, self).__init__()
         self.depth = config.depth
-        self.kernels = config.kernels
+        self.kernels = [4, 4, 4, 4]  # All layers use these parameters
         self.output_shape = output_shape
 
-        self.linear = nn.Linear(self.depth * 32, self.depth * 32)
+        # Input is 230-d RSSM state
+        # Map from 230 -> 4096 (256*4*4)
+        self.linear = nn.Linear(230, 256 * 4 * 4)
         self.deconv_layers = nn.ModuleList()
 
-        num_layers = len(self.kernels)
-        for i, kernel in enumerate(self.kernels):
-            if i != num_layers - 1:
-                out_c = (2 ** (num_layers - i - 2)) * self.depth
-                self.deconv_layers.append((kernel, out_c, True))
+        in_channels = 256
+        # Each layer: kernel=4, stride=2, padding=1 doubles spatial dims
+        for i in range(len(self.kernels)):
+            if i < len(self.kernels) - 1:
+                out_c = in_channels // 2
+                layer = nn.ConvTranspose2d(
+                    in_channels, out_c, kernel_size=4, stride=2, padding=1
+                )
+                in_channels = out_c
             else:
-                self.deconv_layers.append((kernel, output_shape[-1], False))
+                out_c = self.output_shape[0]
+                layer = nn.ConvTranspose2d(
+                    in_channels, out_c, kernel_size=4, stride=2, padding=1
+                )
+            self.deconv_layers.append(layer)
 
     def forward(self, features):
-        # features: [B,T,D]
         B, T, D = features.shape
-        flat = features.view(B * T, D)
+        # features should be [B,T,230]
+        x = self.linear(features.view(B * T, D))
+        x = x.view(B * T, 256, 4, 4)
+        for i, layer in enumerate(self.deconv_layers):
+            x = layer(x)
+            # Apply nonlinearity to all but the last layer
+            if i < len(self.deconv_layers) - 1:
+                x = F.elu(x)
 
-        x = self.linear(flat)  # [B*T, 32*depth]
-        x = x.view(B * T, 32 * self.depth, 1, 1)
-
-        for i, (kernel, out_c, intermediate) in enumerate(self.deconv_layers):
-            deconv = nn.ConvTranspose2d(
-                x.size(1), out_c, kernel_size=kernel, stride=2, padding=0
-            ).to(x.device)
-            x = deconv(x)
-            if intermediate:
-                x = F.relu(x)
-
-        # x: [B*T,C,H,W]
-        # reshape back to [B,T,H,W,C]
-        C = self.output_shape[0]
-        H, W = x.size(2), x.size(3)
+        # Final shape: (B,T,C,H,W)
+        C, H, W = x.size(1), x.size(2), x.size(3)
         x = x.view(B, T, C, H, W)
-
         loc = x
         scale = torch.ones_like(x)
         dist = Independent(Normal(loc, scale), len(self.output_shape))
@@ -99,6 +97,7 @@ class TransitionDecoder(nn.Module):
         super(TransitionDecoder, self).__init__()
         self.dist_type = dist
         self.output_sizes = config.output_sizes
+        # print("Layer sizes:", self.output_sizes)
         layers = []
         input_dim = self.output_sizes[0]
         for size in self.output_sizes[1:]:
@@ -107,11 +106,13 @@ class TransitionDecoder(nn.Module):
             input_dim = size
         self.mlp = nn.Sequential(*layers)
 
-    def forward(self, features: torch.Tensor):
+    def forward(self, features):
+        # print(features.shape)
         B, T, D = features.shape
         x = features.view(B * T, D)
+        # print(x.shape)
         x = self.mlp(x)
-        x = x.view(B, T, D)
+        x = x.view(B, T, self.output_sizes[-1])
 
         if self.dist_type == "normal":
             loc = x
@@ -144,7 +145,7 @@ class Prior(nn.Module):
     def __init__(self, n_actions, config):
         super(Prior, self).__init__()
         self.stoch_size = config.rssm.stochastic_size
-        self.det_size = config.rssm.determinisitc_size
+        self.det_size = config.rssm.deterministic_size
         self.hidden_size = config.rssm.hidden_size
         self.h1 = nn.Linear(self.stoch_size + n_actions, self.det_size)
         self.gru = nn.GRUCell(self.det_size, self.det_size)
@@ -155,7 +156,11 @@ class Prior(nn.Module):
         stoch, det = prev_state
         # Concatenate the previous action and the previous stochastic state.
         # This forms the input to the model for predicting the next latent state.
+        print("Prev action:", prev_action.shape)
+        print("Stoch:", stoch)
+        print("Stoch:", stoch.shape)
         cat = torch.cat([prev_action, stoch], dim=-1)
+        print("Cat:", cat.shape)
         x = F.elu(self.h1(cat))
         det = self.gru(x, det)  # Recurrently update the deterministic state.
         x = F.elu(self.h2(det))
@@ -185,16 +190,21 @@ class Posterior(nn.Module):
         self.stoch_size = config.rssm.stochastic_size
         self.det_size = config.rssm.deterministic_size
         self.hidden_size = config.rssm.hidden_size
-        self.h1 = nn.Linear(self.det_size + self.stoch_size, self.hidden_size)
-        self.h2 = nn.Linear(self.hidden_size, self.stoch_size * 2)
+        self.h1 = nn.Linear(1224, self.det_size + self.stoch_size)
+        self.h2 = nn.Linear(self.det_size + self.stoch_size, self.hidden_size)
+        self.h3 = nn.Linear(self.hidden_size, self.stoch_size * 2)
 
     def forward(self, prev_state, observation):
         _, det = prev_state
         # Concatenate the deterministic state and the current observation.
         # This gives the model direct "evidence" from the new observation.
+        # print("Det:", det.shape)
+        # print("Obs:", observation.shape)
         cat = torch.cat([det, observation], dim=-1)
+        # print("Cat:", cat.shape)
         x = F.elu(self.h1(cat))
-        x = self.h2(x)
+        x = F.elu(self.h2(x))
+        x = self.h3(x)
         mean, stddev = torch.chunk(x, 2, dim=-1)
         stddev = F.softplus(stddev) + 0.1
         # Construct a Normal distribution representing the posterior belief of the next state.
@@ -264,6 +274,9 @@ class RSSM(nn.Module):
         priors = []
         posteriors = []
         batch_size, time_size = observations.size(0), observations.size(1)
+        # print("Batch size:", batch_size)
+        # print("Time size:", time_size)
+        # print("Observations shape:", observations.shape)
         feat_dim = self.stoch_size + self.det_size
         features = torch.zeros(
             batch_size, time_size, feat_dim, device=observations.device
@@ -274,12 +287,13 @@ class RSSM(nn.Module):
         )
 
         for t in range(time_size):
+            # Compute (prior, posterior) and update the state using the current observation & action
             (prior, posterior), state = self.forward(
                 state, actions[:, t], observations[:, t]
             )
-            # Extract mean and std from prior and posterior
-            # prior and posterior are Independent(Normal(...),1)
-            # mean: [B,D], stddev: [B,D]
+
+            # Store the mean/std of the prior and posterior distributions.
+            # This will be used to construct a joint distribution over time.
             prior_mean = prior.base_dist.loc
             prior_std = prior.base_dist.scale
             post_mean = posterior.base_dist.loc
@@ -288,6 +302,7 @@ class RSSM(nn.Module):
             priors.append((prior_mean, prior_std))
             posteriors.append((post_mean, post_std))
 
+            # Store the latent features at this time step
             features[:, t] = torch.cat(state, dim=-1)
 
         def joint_mvn(dists):
@@ -321,17 +336,20 @@ class WorldModel(nn.Module):
     def __init__(
         self,
         obs_shape,
+        act_space,
         config,
     ):
         super(WorldModel, self).__init__()
-        self.rssm = RSSM(config.rssm)
+        self.rssm = RSSM(act_space, config)
         self.encoder = ObservationEncoder(obs_shape, config.encoder)
         self.decoder = ObservationDecoder(obs_shape, config.decoder)
-        self.reward = TransitionDecoder(config.reward_decoder, "normal")
-        self.terminal = TransitionDecoder(config.terminal_decoder, "bernoulli")
+        self.reward = TransitionDecoder(config.reward, "normal")
+        self.terminal = TransitionDecoder(config.terminal, "bernoulli")
 
         self.optimizer = torch.optim.Adam(
-            self.parameters(), lr=config.model_opt.lr, eps=config.model_opt.eps
+            self.parameters(),
+            lr=float(config.model_opt.lr),
+            eps=float(config.model_opt.eps),
         )
 
     def forward(self, prev_state, prev_action, observation):
@@ -347,7 +365,9 @@ class WorldModel(nn.Module):
 
     def observe(self, observations, actions):
         encoded_obs = self.encoder(observations)
+        print("Encoded obs shape:", encoded_obs.shape)
         (prior, posterior), features = self.rssm.observe(encoded_obs, actions)
+        print("State shape:", features.shape)
         reward_dist = self.reward(features)  # Normal distribution
         terminal_dist = self.terminal(features)  # Bernoulli distribution
         decoded_obs = self.decoder(features)  # Normal distribution
@@ -360,12 +380,12 @@ class Actor(nn.Module):
         self.action_space = action_space
         self.input_dim = config.rssm.stochastic_size + config.rssm.deterministic_size
         self.min_stddev = config.actor.min_stddev
-        self.hidden_size = config.actor.output_sizes
+        self.hidden_sizes = config.actor.output_sizes
 
         self.init_layers()
 
         self.optimizer = torch.optim.Adam(
-            self.parameters(), lr=config.actor.lr, eps=config.actor.eps
+            self.parameters(), lr=float(config.actor.lr), eps=float(config.actor.eps)
         )
 
     def init_layers(self):
@@ -426,7 +446,7 @@ class Critic(nn.Module):
         self.init_layers()
 
         self.optimizer = torch.optim.Adam(
-            self.parameters(), lr=config.critic.lr, eps=config.critic.eps
+            self.parameters(), lr=float(config.critic.lr), eps=float(config.critic.eps)
         )
 
     def init_layers(self):
