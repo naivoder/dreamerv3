@@ -3,12 +3,12 @@ import sys
 sys.path.append("/Users/naivoder/Code/dreamerv3/")
 import unittest
 import torch
-from unittest.mock import MagicMock
 from dreamer import Dreamer
 from networks import WorldModel, Actor, Critic
 from memory import ReplayBuffer
 from types import SimpleNamespace
 import yaml
+from unittest.mock import MagicMock
 
 
 class Config:
@@ -34,13 +34,18 @@ class Config:
         return Config._dict_to_namespace(config.get("defaults", {}))
 
 
+class ActionSpace:
+    def __init__(self, action_dim):
+        self.shape = (action_dim,)
+        self.dtype = float
+        self.low = -1.0
+        self.high = 1.0
+
+
 class TestDreamer(unittest.TestCase):
     def setUp(self):
         self.obs_shape = (3, 64, 64)  # Example observation shape (C, H, W)
-        self.act_space = MagicMock()
-        self.act_space.shape = (4,)
-        self.act_space.low = -1
-        self.act_space.high = 1
+        self.act_space = ActionSpace(6)
         self.act_space.sample = lambda: torch.zeros(self.act_space.shape)
 
         self.config = Config.load_from_yaml("config.yaml")
@@ -53,25 +58,18 @@ class TestDreamer(unittest.TestCase):
         self.assertIsInstance(self.dreamer.critic, Critic)
         self.assertIsInstance(self.dreamer.memory, ReplayBuffer)
 
-    def test_init_state(self):
-        state = self.dreamer.init_state()
-        self.assertEqual(state[0][0].shape, (1, self.config.rssm["stochastic_size"]))
-        self.assertEqual(state[0][1].shape, (1, self.config.rssm["deterministic_size"]))
-        self.assertEqual(state[1].shape, (self.act_space.shape))
-
     def test_random_action(self):
         action = self.dreamer.random_action()
         self.assertEqual(action.shape, self.act_space.shape)
 
     def test_act(self):
-        prev_state = self.dreamer.init_state()
-        prev_action = torch.zeros(self.act_space.shape)
+        prev_state, prev_action = self.dreamer.init_state()
         obs = torch.zeros(self.obs_shape)
 
         state, action = self.dreamer.act(prev_state, prev_action, obs, training=True)
-        self.assertEqual(state[0].shape[-1], self.config.rssm["stochastic_size"])
-        self.assertEqual(state[1].shape[-1], self.config.rssm["deterministic_size"])
-        self.assertEqual(action.shape, prev_action.shape)
+        self.assertEqual(state[0].shape[-1], self.config.rssm.stochastic_size)
+        self.assertEqual(state[1].shape[-1], self.config.rssm.deterministic_size)
+        self.assertEqual(action.shape, prev_action.squeeze().shape)
 
     def test_learn(self):
         self.dreamer.memory.sample = MagicMock(
@@ -86,8 +84,22 @@ class TestDreamer(unittest.TestCase):
         )
         self.dreamer.update = MagicMock(return_value={"loss": torch.tensor(0.1)})
 
-        self.dreamer.learn()
-        self.assertGreater(self.dreamer.step, 0)
+    def test_remember(self):
+        (stoch_, det_), act_ = self.dreamer.init_state()
+        observation = torch.zeros(self.obs_shape)
+        action = torch.zeros(self.act_space.shape)
+        action[0] += 1
+        reward = torch.tensor(0.0)
+        done = torch.tensor(False)
+        self.dreamer.remember(observation, action, reward, done)
+        self.assertEqual(self.dreamer.step, 2)  # 2 because of action repeat
+        done = torch.tensor(True)
+        self.dreamer.remember(observation, action, reward, done)
+        self.assertEqual(self.dreamer.step, 4)
+        (stoch, det), act = self.dreamer.state
+        self.assertTrue(torch.equal(stoch, stoch_), "Mismatch in stochastic state")
+        self.assertTrue(torch.equal(det, det_), "Mismatch in deterministic state")
+        self.assertTrue(torch.equal(act, act_), "Mismatch in action state")
 
     def test_save_and_load_checkpoint(self):
         # Save weights

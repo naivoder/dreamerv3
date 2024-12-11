@@ -13,7 +13,7 @@ defaults:
   update_steps: 100
   replay: { capacity: 1000, batch_size: 32, sequence_length: 50 }
   jit: True
-  render_episodes: 0
+  render_episodes: 1
   evaluate_model: True
   precision: 16
   initialization: glorot
@@ -21,7 +21,7 @@ defaults:
   # World Model
   rssm: { hidden_size: 200, deterministic_size: 200, stochastic_size: 30 }
   model_opt: { lr: 6e-4, eps: 1e-7, clip: 100 }
-  encoder: { depth: 32, kernels: [4, 4, 4, 4] }
+  encoder: { depth: 32, kernels: [4, 4, 4, 4], output_dim: 1024 }
   decoder: { depth: 32, kernels: [5, 5, 6, 6] }
   reward: { output_sizes: [230, 400, 400, 400, 1] }
   terminal: { output_sizes: [230, 400, 400, 400, 1] }

@@ -1,4 +1,5 @@
 import numpy as np
+import gym
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,7 +30,7 @@ class ObservationEncoder(nn.Module):
         self.convs = nn.ModuleList(conv_layers)
 
     def forward(self, x):
-        print(x.shape)
+        # print(x.shape)
         B, T, C, H, W = x.shape
         x = x.view(B * T, C, H, W)
 
@@ -44,7 +45,7 @@ class ObservationDecoder(nn.Module):
     def __init__(self, output_shape, config):
         super(ObservationDecoder, self).__init__()
         self.depth = config.depth
-        self.kernels = [4, 4, 4, 4]  # All layers use these parameters
+        self.kernels = [4, 4, 4, 4]
         self.output_shape = output_shape
 
         # Input is 230-d RSSM state
@@ -147,7 +148,8 @@ class Prior(nn.Module):
         self.stoch_size = config.rssm.stochastic_size
         self.det_size = config.rssm.deterministic_size
         self.hidden_size = config.rssm.hidden_size
-        self.h1 = nn.Linear(self.stoch_size + n_actions, self.det_size)
+        self.input_shape = self.stoch_size + n_actions
+        self.h1 = nn.Linear(self.input_shape, self.det_size)
         self.gru = nn.GRUCell(self.det_size, self.det_size)
         self.h2 = nn.Linear(self.det_size, self.hidden_size)
         self.h3 = nn.Linear(self.hidden_size, self.stoch_size * 2)
@@ -156,18 +158,21 @@ class Prior(nn.Module):
         stoch, det = prev_state
         # Concatenate the previous action and the previous stochastic state.
         # This forms the input to the model for predicting the next latent state.
-        print("Prev action:", prev_action.shape)
-        print("Stoch:", stoch)
-        print("Stoch:", stoch.shape)
+        # print("\nPrior Prev Action:", prev_action.shape)
+        # print("Stoch:", stoch)
+        # print("Prior Stoch:", stoch.shape)
         cat = torch.cat([prev_action, stoch], dim=-1)
-        print("Cat:", cat.shape)
+        # print("Prior Cat:", cat.shape)
+        # print("Prior Input shape:", self.input_shape)
         x = F.elu(self.h1(cat))
         det = self.gru(x, det)  # Recurrently update the deterministic state.
+        # print("Prior Det:", det.shape)
         x = F.elu(self.h2(det))
         # Final linear layer outputs twice as many values as the stochastic size:
         # half for the mean of the next stochastic state, half for the stddev.
         # The output shape: [..., 2 * stochastic_size]
         x = self.h3(x)
+        # print("Prior x:", x.shape)
         mean, stddev = torch.chunk(x, 2, dim=-1)
         # Use softplus to ensure stddev > 0, and add a small offset to improve stability.
         stddev = F.softplus(stddev) + 0.1
@@ -190,21 +195,21 @@ class Posterior(nn.Module):
         self.stoch_size = config.rssm.stochastic_size
         self.det_size = config.rssm.deterministic_size
         self.hidden_size = config.rssm.hidden_size
-        self.h1 = nn.Linear(1224, self.det_size + self.stoch_size)
-        self.h2 = nn.Linear(self.det_size + self.stoch_size, self.hidden_size)
-        self.h3 = nn.Linear(self.hidden_size, self.stoch_size * 2)
+        self.obs_size = config.encoder.output_dim
+        self.h1 = nn.Linear(self.obs_size + self.det_size, self.hidden_size)
+        self.h2 = nn.Linear(self.hidden_size, self.stoch_size * 2)
 
     def forward(self, prev_state, observation):
         _, det = prev_state
+        observation = observation.squeeze(1)
         # Concatenate the deterministic state and the current observation.
         # This gives the model direct "evidence" from the new observation.
-        # print("Det:", det.shape)
-        # print("Obs:", observation.shape)
+        # print("\nPosterior Det:", det.shape)
+        # print("Posterior Embed:", observation.shape)
         cat = torch.cat([det, observation], dim=-1)
         # print("Cat:", cat.shape)
         x = F.elu(self.h1(cat))
-        x = F.elu(self.h2(x))
-        x = self.h3(x)
+        x = self.h2(x)
         mean, stddev = torch.chunk(x, 2, dim=-1)
         stddev = F.softplus(stddev) + 0.1
         # Construct a Normal distribution representing the posterior belief of the next state.
@@ -226,6 +231,9 @@ class RSSM(nn.Module):
         self.horizon = config.imag_horizon
 
     def forward(self, prev_state, prev_action, observation):
+        # print("\nRSSM Embed shape: ", observation.shape, observation.dtype)
+        # print("RSSM Prev state:", prev_state[0].shape, prev_state[1].shape)
+        # print("RSSM Prev action:", prev_action)
         prior, state = self.prior(prev_state, prev_action)
         posterior, state = self.posterior(state, observation)
         return (prior, posterior), state
@@ -336,15 +344,15 @@ class WorldModel(nn.Module):
     def __init__(
         self,
         obs_shape,
-        act_space,
+        n_actions,
         config,
     ):
         super(WorldModel, self).__init__()
-        self.rssm = RSSM(act_space, config)
         self.encoder = ObservationEncoder(obs_shape, config.encoder)
         self.decoder = ObservationDecoder(obs_shape, config.decoder)
         self.reward = TransitionDecoder(config.reward, "normal")
         self.terminal = TransitionDecoder(config.terminal, "bernoulli")
+        self.rssm = RSSM(n_actions, config)
 
         self.optimizer = torch.optim.Adam(
             self.parameters(),
@@ -353,7 +361,11 @@ class WorldModel(nn.Module):
         )
 
     def forward(self, prev_state, prev_action, observation):
+        # print("\nWorld Obs shape: ", observation.shape, observation.dtype)
         encoded_obs = self.encoder(observation)
+        # print("World Embed shape: ", encoded_obs.shape, encoded_obs.dtype)
+        # print("World Prev state:", prev_state[0].shape, prev_state[1].shape)
+        # print("World Prev action:", prev_action)
         (prior, posterior), state = self.rssm(prev_state, prev_action, encoded_obs)
         return (prior, posterior), state
 
@@ -365,9 +377,9 @@ class WorldModel(nn.Module):
 
     def observe(self, observations, actions):
         encoded_obs = self.encoder(observations)
-        print("Encoded obs shape:", encoded_obs.shape)
+        # print("Encoded obs shape:", encoded_obs.shape)
         (prior, posterior), features = self.rssm.observe(encoded_obs, actions)
-        print("State shape:", features.shape)
+        # print("State shape:", features.shape)
         reward_dist = self.reward(features)  # Normal distribution
         terminal_dist = self.terminal(features)  # Bernoulli distribution
         decoded_obs = self.decoder(features)  # Normal distribution
@@ -379,7 +391,7 @@ class Actor(nn.Module):
         super(Actor, self).__init__()
         self.action_space = action_space
         self.input_dim = config.rssm.stochastic_size + config.rssm.deterministic_size
-        self.min_stddev = config.actor.min_stddev
+        self.min_stddev = float(config.actor.min_stddev)
         self.hidden_sizes = config.actor.output_sizes
 
         self.init_layers()
@@ -395,7 +407,9 @@ class Actor(nn.Module):
         )
         # If continuous, output mean and std for each action dimension
         # If discrete, output logits for each action dimension
-        if self.is_continuous:
+        if isinstance(
+            self.action_space, gym.spaces.Box
+        ):  # For continuous action spaces
             self.action_dim = self.action_space.shape[0]
             # We will produce mean and stddev for continuous actions
             # So final layer dimension: action_dim * 2

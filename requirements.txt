@@ -10,3 +10,5 @@ pandas
 psutil
 zmq
 termcolor
+gym 
+dm-control

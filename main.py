@@ -5,18 +5,25 @@ from collections import defaultdict
 import torch
 import numpy as np
 from tqdm import tqdm
+import warnings
+
+from utils import Config
+import env_wrappers
+from dreamer import Dreamer
+
+warnings.filterwarnings("ignore")
 
 
 def do_episode(agent, training, environment, config, pbar, render):
     episode_summary = defaultdict(list)
     steps = 0
     done = False
-    observation = environment.reset()
+    observation, _ = environment.reset()
 
     while not done:
-        action = agent.act(torch.tensor(observation, dtype=torch.float32), training)
-        next_observation, reward, done, info = environment.step(action)
-        terminal = done and not info.get("TimeLimit.truncated", False)
+        action = agent(torch.tensor(observation, dtype=torch.float32), training)
+        next_observation, reward, term, trunc, info = environment.step(action)
+        terminal = term or trunc
 
         if training:
             agent.observe(
@@ -86,7 +93,7 @@ def make_summary(summaries, prefix):
     return epoch_summary
 
 
-def evaluate(agent, train_env, logger, config, steps):
+def evaluate(agent, train_env, config, steps):
     evaluation_steps, evaluation_episodes_summaries = interact(
         agent, train_env, config.evaluation_steps_per_epoch, config, training=False
     )
@@ -96,7 +103,7 @@ def evaluate(agent, train_env, logger, config, steps):
             episode.get("image")
             for episode in evaluation_episodes_summaries[: config.render_episodes]
         ]
-        logger.log_video(
+        agent.logger.log_video(
             np.array(videos, copy=False).transpose([0, 1, 4, 2, 3]),
             steps,
             name="videos/overview",
@@ -114,7 +121,7 @@ def evaluate(agent, train_env, logger, config, steps):
             agent.model.parameters(),
         )
         for vid, name in zip(more_videos, ("gt", "inferred", "generated")):
-            logger.log_video(
+            agent.logger.log_video(
                 np.array(vid, copy=False).transpose([0, 1, 4, 2, 3]),
                 steps,
                 name=f"videos/{name}",
@@ -131,24 +138,24 @@ def on_episode_end(episode_summary, logger, global_step, steps_count):
     logger.log_evaluation_summary(summary, steps)
 
 
-def train(config, agent, environment, logger):
+def train(config, agent, environment):
     steps = 0
 
-    if pathlib.Path(config.log_dir, "agent_data.pt").exists():
-        agent.load(os.path.join(config.log_dir, "agent_data.pt"))
-        steps = agent.training_step
-        print(f"Loaded {steps} steps. Continuing training from {config.log_dir}")
+    # if pathlib.Path(config.log_dir, "agent_data.pt").exists():
+    #     agent.load(os.path.join(config.log_dir, "agent_data.pt"))
+    #     steps = float(agent.training_step)
+    #     print(f"Loaded {steps} steps. Continuing training from {config.log_dir}")
 
-    while steps < config.steps:
+    while steps < float(config.steps):
         print("Performing a training epoch.")
         training_steps, training_episodes_summaries = interact(
             agent,
             environment,
-            config.training_steps_per_epoch,
+            float(config.training_steps_per_epoch),
             config,
             training=True,
             on_episode_end=lambda summary, count: on_episode_end(
-                summary, logger, steps, count
+                summary, agent.logger, steps, count
             ),
         )
         steps += training_steps
@@ -156,10 +163,10 @@ def train(config, agent, environment, logger):
 
         if config.evaluation_steps_per_epoch:
             print("Evaluating.")
-            evaluation_summaries = evaluate(agent, environment, logger, config, steps)
+            evaluation_summaries = evaluate(agent, environment, config, steps)
             training_summary.update(evaluation_summaries)
 
-        logger.log_evaluation_summary(training_summary, steps)
+        agent.logger.log_evaluation_summary(training_summary, steps)
         agent.save(os.path.join(config.log_dir, "agent_data.pt"))
 
     environment.close()
@@ -201,22 +208,9 @@ def evaluate_model(observations, actions, model, model_params):
     return out
 
 
-def load_config():
-    import argparse
-    import yaml
+if __name__ == "__main__":
+    config = Config.load_from_yaml("config.yaml")
+    env = env_wrappers.make_env(config)
+    agent = Dreamer(env.observation_space.shape, env.action_space, config)
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--configs", nargs="+", required=True)
-    args, remaining = parser.parse_known_args()
-
-    with open("dreamer/config.yaml") as file:
-        configs = yaml.safe_load(file)
-
-    defaults = {}
-    for name in args.configs:
-        defaults.update(configs[name])
-
-    for key, value in defaults.items():
-        parser.add_argument(f"--{key}", type=type(value), default=value)
-
-    return parser.parse_args(remaining)
+    train(config, agent, env)

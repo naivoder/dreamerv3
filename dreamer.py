@@ -1,7 +1,4 @@
 import torch
-import torch.nn as nn
-import torch.optim as optim
-import numpy as np
 import torch.nn.functional as F
 from tqdm import tqdm
 from collections import defaultdict
@@ -10,6 +7,7 @@ import utils
 import networks
 from memory import ReplayBuffer
 from logger import TrainingLogger
+import gym
 
 
 class Dreamer:
@@ -18,11 +16,15 @@ class Dreamer:
         self.config = config
         self.path = f"weights/{config.task}"
 
-        self.act_shape = act_space.shape
+        if isinstance(act_space, gym.spaces.Box):  # For continuous action spaces
+            self.n_actions = act_space.shape[0]
+        elif isinstance(act_space, gym.spaces.Discrete):  # For discrete action spaces
+            self.n_actions = act_space.n
+
         self.act_low, self.act_high = act_space.low, act_space.high
         self.random_action = lambda: act_space.sample()
 
-        self.world_model = networks.WorldModel(obs_shape, act_space, config).to(
+        self.world_model = networks.WorldModel(obs_shape, self.n_actions, config).to(
             self.device
         )
         self.actor = networks.Actor(act_space, config).to(self.device)
@@ -54,12 +56,16 @@ class Dreamer:
     def init_state(self):
         stoch = torch.zeros(1, self.config.rssm.stochastic_size)
         det = torch.zeros(1, self.config.rssm.deterministic_size)
-        action = torch.zeros(self.act_shape)
+        action = torch.zeros((1, self.n_actions))
         return (stoch, det), action
 
     def act(self, prev_state, prev_action, obs, training=True):
         # Add batch and time dimensions to single observation
         obs = obs.unsqueeze(0).unsqueeze(0)
+        # print("Dreamer Prev State: ", len(prev_state))
+        # print("Dreamer Prev State: ", prev_state[0].shape, prev_state[1].shape)
+        # print("Dreamer Prev Action: ", prev_action)
+        # print("Dreamer Obs Shape: ", obs.shape, obs.dtype)
 
         # Process observation to get latent state
         _, current_state = self.world_model(prev_state, prev_action, obs)
@@ -205,11 +211,17 @@ class Dreamer:
 
         return metrics
 
-    def remember(self, obs, act, rew, done):
-        self.step += self.config.action_repeat
+    def observe(self, transition):
+        obs = transition["observation"]
+        act = transition["action"]
+        rew = transition["reward"]
+        done = transition["terminal"]
+
         self.memory.store(obs, act, rew, done)
         if done:
             self.state = self.init_state()
+
+        self.step += self.config.action_repeat
 
     @property
     def warmup_episodes(self):

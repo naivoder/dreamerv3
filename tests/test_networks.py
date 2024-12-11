@@ -12,6 +12,7 @@ class TestNetworkShapes(unittest.TestCase):
             def __init__(self):
                 self.depth = 32
                 self.kernels = [4, 4, 4, 4]
+                self.output_dim = 1024
 
         class DecoderConfig:
             def __init__(self):
@@ -65,8 +66,8 @@ class TestNetworkShapes(unittest.TestCase):
                 self.encoder = EncoderConfig()
                 self.decoder = DecoderConfig()
                 self.rssm = RSSMConfig()
-                self.reward_decoder = RewardDecoderConfig()
-                self.terminal_decoder = TerminalDecoderConfig()
+                self.reward = RewardDecoderConfig()
+                self.terminal = TerminalDecoderConfig()
                 self.model_opt = ModelOpt()
                 self.actor = ActorConfig(action_space)
                 self.critic = CriticConfig()
