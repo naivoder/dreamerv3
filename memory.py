@@ -37,7 +37,7 @@ class ReplayBuffer:
                     batch[k].append(ep[k][t : t + self.seq_length])
 
             for k in batch.keys():
-                batch[k] = torch.tensor(batch[k], device=self.device)
+                batch[k] = torch.tensor(np.array(batch[k]), device=self.device)
 
             batch["observation"] = utils.preprocess(batch["observation"])
             yield batch

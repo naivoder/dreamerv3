@@ -21,17 +21,17 @@ def do_episode(agent, training, environment, config, pbar, render):
     observation, _ = environment.reset()
 
     while not done:
-        action = agent(torch.tensor(observation, dtype=torch.float32).permute(2, 0, 1), training)
+        action = agent(torch.tensor(observation, dtype=torch.float32), training)
         next_observation, reward, term, trunc, info = environment.step(action)
         done = term or trunc
 
         if training:
-            agent.observe(
+            agent.remember(
                 {
-                    "observation": torch.tensor(observation, dtype=torch.float32).permute(2, 0, 1),
+                    "observation": torch.tensor(observation, dtype=torch.float32),
                     "next_observation": torch.tensor(
                         next_observation, dtype=torch.float32
-                    ).permute(2, 0, 1),
+                    ),
                     "action": torch.tensor(action, dtype=torch.float32),
                     "reward": torch.tensor(reward, dtype=torch.float32),
                     "terminal": torch.tensor(done, dtype=torch.float32),
@@ -52,7 +52,6 @@ def do_episode(agent, training, environment, config, pbar, render):
 
         pbar.update(config.action_repeat)
         steps += config.action_repeat
-
 
     episode_summary["steps"] = [steps]
     return steps, episode_summary
@@ -118,8 +117,8 @@ def evaluate(agent, train_env, config, steps):
             torch.tensor(
                 evaluation_episodes_summaries[0]["action"], dtype=torch.float32
             ),
-            agent.model,
-            agent.model.parameters(),
+            agent.world_model,
+            agent.world_model.parameters(),
         )
         for vid, name in zip(more_videos, ("gt", "inferred", "generated")):
             agent.logger.log_video(
@@ -168,35 +167,31 @@ def train(config, agent, environment):
             training_summary.update(evaluation_summaries)
 
         agent.logger.log_evaluation_summary(training_summary, steps)
-        agent.save(os.path.join(config.log_dir, "agent_data.pt"))
-
+        agent.save_checkpoint()
     environment.close()
     return agent
 
 
-def evaluate_model(observations, actions, model, model_params):
+def evaluate_model(observations, actions, world_model):
     length = min(len(observations) + 1, 50)
 
-    observations, actions = [
-        torch.tensor(x, dtype=torch.float32) for x in (observations, actions)
-    ]
+    observations = torch.tensor(observations, dtype=torch.float32)
+    actions = torch.tensor(actions, dtype=torch.float32)
 
     with torch.no_grad():
-        _, features, inferred_decoded, *_ = model.infer(
-            model_params,
+        _, features, inferred_decoded, *_ = world_model.observe_sequence(
             observations[:length].unsqueeze(0),
             actions[:length].unsqueeze(0),
         )
 
         conditioning_length = length // 5
 
-        generated, *_ = model.generate_sequence(
-            model_params,
+        generated, *_ = world_model.generate_sequence(
             features[:, conditioning_length],
-            actions=actions[conditioning_length:].unsqueeze(0),
+            actions[conditioning_length:].unsqueeze(0),
         )
 
-        generated_decoded = model.decode(model_params, generated)
+        generated_decoded = world_model.decode(generated)
 
         out = (
             observations[conditioning_length:length].unsqueeze(0),

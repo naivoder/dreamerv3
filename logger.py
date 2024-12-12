@@ -2,8 +2,8 @@ from tensorboardX import SummaryWriter
 
 
 class TrainingLogger:
-    def __init__(self, config):
-        self._writer = SummaryWriter(config.log_dir)
+    def __init__(self, log_dir):
+        self._writer = SummaryWriter(log_dir)
 
     def log_evaluation_summary(self, summary, step):
         for k, v in summary.items():

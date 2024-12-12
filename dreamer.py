@@ -13,28 +13,36 @@ import gym
 class Dreamer:
     def __init__(self, obs_shape, act_space, config):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.config = config
+        self.obs_shape = obs_shape
+        self.stoch_size = 30
+        self.det_size = 200
+        self.kl_scale = config.kl_scale
+        self.clip = config.actor.clip
+        self.lambda_ = config.lambda_
+        self.discount = config.discount
+        self.imag_horizon = config.imag_horizon
         self.path = f"weights/{config.task}"
-        self.obs_shape = (obs_shape[2], obs_shape[0], obs_shape[1])
-
-        if isinstance(act_space, gym.spaces.Box):  # For continuous action spaces
-            self.n_actions = act_space.shape[0]
-        elif isinstance(act_space, gym.spaces.Discrete):  # For discrete action spaces
-            self.n_actions = act_space.n
-
+        self.update_steps = config.update_steps
+        self.action_repeat = config.action_repeat
+        self.prefill = config.prefill
         self.free_nats = torch.tensor(config.free_nats).to(self.device)
+
+        if isinstance(act_space, gym.spaces.Discrete):  # For discrete action spaces
+            self.n_actions = act_space.n
+        else:  # For continuous action spaces / if isinstance(act_space, gym.spaces.Box)
+            self.n_actions = act_space.shape[0]
+
+        # print("Number of Actions: ", self.n_actions, type(self.n_actions))
 
         self.act_low, self.act_high = act_space.low, act_space.high
         self.random_action = lambda: act_space.sample()
 
-        self.world_model = networks.WorldModel(self.obs_shape, self.n_actions, config).to(
-            self.device
-        )
-        self.actor = networks.Actor(act_space, config).to(self.device)
-        self.critic = networks.Critic(config).to(self.device)
+        self.world_model = networks.WorldModel(self.n_actions).to(self.device)
+        self.actor = networks.Actor(act_space).to(self.device)
+        self.critic = networks.Critic().to(self.device)
 
         self.memory = ReplayBuffer(config.replay, self.device)
-        self.logger = TrainingLogger(config)
+        self.logger = TrainingLogger(config.log_dir)
 
         self.state = self.init_state()
         self.step = 0
@@ -48,22 +56,18 @@ class Dreamer:
                 self.learn()
 
         prev_state, prev_action = self.state
-        state, action = self.act(prev_state, prev_action, obs.to(self.device), training)
+        state, action = self.act(prev_state, prev_action, obs, training)
         self.state = state, action
 
         return np.clip(action.squeeze().cpu().numpy(), self.act_low, self.act_high)
 
-    def init_weights(self):
-        pass
-
     def init_state(self):
-        stoch = torch.zeros(1, self.config.rssm.stochastic_size).to(self.device)
-        det = torch.zeros(1, self.config.rssm.deterministic_size).to(self.device)
+        stoch = torch.zeros(1, self.stoch_size).to(self.device)
+        det = torch.zeros(1, self.det_size).to(self.device)
         action = torch.zeros((1, self.n_actions)).to(self.device)
         return (stoch, det), action
 
     def act(self, prev_state, prev_action, obs, training=True):
-        # print("\nStarting Act")
         # Add batch and time dimensions to single observation
         obs = obs.unsqueeze(0).unsqueeze(0).to(self.device)
         # print("Dreamer Prev State: ", prev_state[0].shape, prev_state[1].shape)
@@ -82,11 +86,11 @@ class Dreamer:
         # Sample action during training for exploration; use mode for evaluation.
         action = policy.sample() if training else policy.mode()
         # print("Dreamer Action:", action.shape)
-        return current_state, action.unsqueeze(0)
+        return current_state, action.squeeze(0)
 
     def learn(self):
         report = defaultdict(float)
-        steps = self.config.update_steps
+        steps = self.update_steps
         batches = self.memory.sample(steps)
 
         for batch in tqdm(batches, total=steps):
@@ -99,8 +103,12 @@ class Dreamer:
 
     def update(self, batch):
         world_metrics, features = self.update_world_model(batch)
-        actor_metrics, imag_features, lambda_values = self.update_actor(features.detach())
-        critic_metrics = self.update_critic(imag_features, lambda_values.detach())
+        actor_metrics, imag_features, lambda_values = self.update_actor(
+            features.detach()
+        )
+        critic_metrics = self.update_critic(
+            imag_features.detach(), lambda_values.detach()
+        )
 
         metrics = {**world_metrics, **actor_metrics, **critic_metrics}
         return metrics
@@ -116,14 +124,14 @@ class Dreamer:
         rew = batch["reward"]
         done = batch["done"]
 
-
         (prior, posterior), features, decoded, reward, terminal = (
             self.world_model.observe(obs, act)
         )
 
         # Compute KL divergence between prior and posterior
         kl_div = torch.maximum(
-            torch.distributions.kl.kl_divergence(posterior, prior).mean(), self.free_nats
+            torch.distributions.kl.kl_divergence(posterior, prior).mean(),
+            self.free_nats,
         )
 
         # Compute reconstruction loss
@@ -137,13 +145,11 @@ class Dreamer:
         term_loss = terminal.log_prob(done.unsqueeze(-1)).mean()
 
         # Overall world model loss: encourages good reconstruction and small KL.
-        loss = self.config.kl_scale * kl_div - obs_loss - rew_loss - term_loss
+        loss = self.kl_scale * kl_div - obs_loss - rew_loss - term_loss
 
         self.world_model.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            self.world_model.parameters(), self.config.model_opt.clip
-        )
+        torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), self.clip)
         grad_norm = utils.global_norm([p.grad for p in self.world_model.parameters()])
         self.world_model.optimizer.step()
 
@@ -169,23 +175,27 @@ class Dreamer:
         flat_feats = features.view(-1, features.shape[-1])
 
         # Generate imaginary futures using the actor
-        imag_feats, rewards_dist, terminals_dist = self.world_model.imagine(flat_feats, self.actor)
+        imag_feats, rewards_dist, terminals_dist = self.world_model.imagine(
+            flat_feats, self.actor
+        )
 
         rewards = rewards_dist.rsample()  # Use .sample() for stochastic updates
-        terminals = terminals_dist.sample()  
-        next_values = self.critic(imag_feats[:, 1:]).mean # Extract value estimates
+        terminals = terminals_dist.sample()
+        next_values = self.critic(
+            imag_feats[:, 1:]
+        ).rsample()  # Extract value estimates
 
         # Compute lambda-returns
         lambda_values = utils.compute_lambda_values(
-            next_values, rewards, terminals, self.config.discount, self.config.lambda_
+            next_values, rewards, terminals, self.discount, self.lambda_
         )
 
-        discount = utils.discount(self.config.discount, self.config.imag_horizon - 1)
+        discount = utils.discount(self.discount, self.imag_horizon - 1)
         loss = (-lambda_values * discount.to(self.device)).mean()
 
         self.actor.optimizer.zero_grad()
-        loss.backward(retain_graph=True)
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.config.actor.clip)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.clip)
         grad_norm = utils.global_norm([p.grad for p in self.actor.parameters()])
         self.actor.optimizer.step()
 
@@ -199,7 +209,6 @@ class Dreamer:
 
         return metrics, imag_feats, lambda_values
 
-
     def update_critic(self, features, lambda_values):
         """
         Update the critic parameters:
@@ -207,19 +216,16 @@ class Dreamer:
         By maximizing log probability of lambda_values, the critic learns a good value function.
         """
         values = self.critic(features[:, :-1])
-        targets = lambda_values
-        discount = utils.discount(self.config.discount, self.config.imag_horizon - 1)
+        discount = utils.discount(self.discount, self.imag_horizon - 1)
 
         # print("Values:",values.shape)
         # print("Targets:", targets.shape)
         # print("Discount:", discount.shape)
-        loss = -(values.log_prob(targets) * discount.to(self.device)).mean()
+        loss = -(values.log_prob(lambda_values) * discount.to(self.device)).mean()
 
         self.critic.optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            self.critic.parameters(), self.config.critic.clip
-        )
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.clip)
         grad_norm = utils.global_norm([p.grad for p in self.critic.parameters()])
         self.critic.optimizer.step()
 
@@ -230,7 +236,7 @@ class Dreamer:
 
         return metrics
 
-    def observe(self, transition):
+    def remember(self, transition):
         # print("Observing")
         obs = transition["observation"]
         act = transition["action"]
@@ -241,15 +247,15 @@ class Dreamer:
         if done:
             self.state = self.init_state()
 
-        self.step += self.config.action_repeat
+        self.step += self.action_repeat
 
     @property
     def warmup_episodes(self):
-        return self.step <= self.config.prefill
+        return self.step <= self.prefill
 
     @property
     def update_interval(self):
-        return self.step % self.config.update_interval == 0
+        return self.step % self.update_interval == 0
 
     def save_checkpoint(self):
         torch.save(self.world_model.state_dict(), f"{self.path}_world_model.pt")

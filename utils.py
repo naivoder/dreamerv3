@@ -2,6 +2,7 @@ import torch
 import numpy as np
 import yaml
 from types import SimpleNamespace
+import torch.nn as nn
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -14,6 +15,45 @@ def preprocess(image):
 def quantize(image):
     # Inverse of preprocess: map [-0.5, 0.5] back to [0, 255] as uint8.
     return ((image + 0.5) * 255).astype(np.uint8)
+
+
+def fan_initializer(scale: float, mode: str, distribution: str):
+    """
+    PyTorch implementation of VarianceScaling initialization.
+
+    Args:
+        scale: Scaling factor (1.0 for Glorot, 2.0 for He).
+        mode: 'fan_in', 'fan_out', or 'fan_avg'.
+        distribution: 'uniform' or 'normal'.
+    Returns:
+        Initialized tensor.
+    """
+
+    def initializer(tensor):
+        fan_in, fan_out = nn.init._calculate_fan_in_and_fan_out(tensor)
+        if mode == "fan_in":
+            denominator = fan_in
+        elif mode == "fan_out":
+            denominator = fan_out
+        elif mode == "fan_avg":
+            denominator = (fan_in + fan_out) / 2
+        else:
+            raise ValueError(f"Unknown mode {mode}")
+
+        variance = torch.tensor(scale / denominator)
+
+        if distribution == "uniform":
+            bound = torch.sqrt(3 * variance)
+            with torch.no_grad():
+                return tensor.uniform_(-bound, bound)
+        elif distribution == "normal":
+            std = torch.sqrt(variance)
+            with torch.no_grad():
+                return tensor.normal_(0, std)
+        else:
+            raise ValueError(f"Unknown distribution {distribution}")
+
+    return initializer
 
 
 def compute_lambda_values(
@@ -37,7 +77,6 @@ def compute_lambda_values(
     # print("next_values shape:", next_values.shape)
     # print("rewards shape:", rewards.shape)
     # print("terminals shape:", terminals.shape)
-
 
     # Initialize the lambda-returns with the bootstrap value.
     v_lambda = next_values[:, -1] * (1.0 - terminals[:, -1])

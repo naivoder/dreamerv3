@@ -12,114 +12,124 @@ from torch.distributions import (
     Bernoulli,
 )
 
+from utils import fan_initializer
+
 
 class ObservationEncoder(nn.Module):
-    def __init__(self, input_shape, config):
-        super(ObservationEncoder, self).__init__()
-        self.depth = config.depth
-        self.kernels = config.kernels
-        self.input_shape = input_shape
+    def __init__(self):
+        super().__init__()
+        self.convs = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=4, stride=2),
+            nn.ELU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ELU(),
+            nn.Conv2d(64, 128, kernel_size=4, stride=2),
+            nn.ELU(),
+            nn.Conv2d(128, 256, kernel_size=4, stride=2),
+            nn.ELU(),
+        )
 
-        conv_layers = []
-        c_in = self.input_shape[0]
-        for i, kernel in enumerate(self.kernels):
-            c_out = (2**i) * self.depth
-            conv = nn.Conv2d(c_in, c_out, kernel_size=kernel, stride=2, padding=0)
-            conv_layers.append(conv)
-            c_in = c_out
-        self.convs = nn.ModuleList(conv_layers)
+        for layer in self.convs:
+            if isinstance(layer, nn.Conv2d):
+                fan_initializer(1.0, "fan_avg", "uniform")(layer.weight)
+                nn.init.zeros_(layer.bias)
 
     def forward(self, x):
-        # print(x.shape)
         B, T, C, H, W = x.shape
         x = x.view(B * T, C, H, W)
-
-        for conv in self.convs:
-            x = F.relu(conv(x))
-
+        x = self.convs(x)
         x = x.view(B, T, -1)
         return x
 
 
 class ObservationDecoder(nn.Module):
-    def __init__(self, output_shape, config):
-        super(ObservationDecoder, self).__init__()
-        self.depth = config.depth
-        self.kernels = [4, 4, 4, 4]
-        self.output_shape = output_shape
+    def __init__(self):
+        """
+        Decoder to reconstruct observations from the 230-dimensional RSSM latent state,
+        predicting only the mean of a normal distribution with fixed variance 1.0.
+        """
+        super().__init__()
+        self.fc = nn.Linear(
+            230, 256 * 4 * 4
+        )  # Project to 256 channels with 1x1 spatial size
+        nn.init.xavier_uniform_(self.fc.weight, gain=nn.init.calculate_gain("relu"))
+        nn.init.zeros_(self.fc.bias)
 
-        # Input is 230-d RSSM state
-        # Map from 230 -> 4096 (256*4*4)
-        self.linear = nn.Linear(230, 256 * 4 * 4)
-        self.deconv_layers = nn.ModuleList()
+        self.deconvs = nn.Sequential(
+            nn.ConvTranspose2d(
+                256, 128, kernel_size=5, stride=2, padding=2, output_padding=1
+            ),
+            nn.ELU(),
+            nn.ConvTranspose2d(
+                128, 64, kernel_size=5, stride=2, padding=2, output_padding=1
+            ),
+            nn.ELU(),
+            nn.ConvTranspose2d(
+                64, 32, kernel_size=6, stride=2, padding=2, output_padding=0
+            ),
+            nn.ELU(),
+            nn.ConvTranspose2d(
+                32, 3, kernel_size=6, stride=2, padding=2, output_padding=0
+            ),
+        )
 
-        in_channels = 256
-        # Each layer: kernel=4, stride=2, padding=1 doubles spatial dims
-        for i in range(len(self.kernels)):
-            if i < len(self.kernels) - 1:
-                out_c = in_channels // 2
-                layer = nn.ConvTranspose2d(
-                    in_channels, out_c, kernel_size=4, stride=2, padding=1
-                )
-                in_channels = out_c
-            else:
-                out_c = self.output_shape[0]
-                layer = nn.ConvTranspose2d(
-                    in_channels, out_c, kernel_size=4, stride=2, padding=1
-                )
-            self.deconv_layers.append(layer)
+        for layer in self.deconvs:
+            if isinstance(layer, nn.ConvTranspose2d):
+                fan_initializer(1.0, "fan_avg", "uniform")(layer.weight)
+                nn.init.zeros_(layer.bias)
 
-    def forward(self, features):
-        B, T, D = features.shape
-        # features should be [B,T,230]
-        x = self.linear(features.view(B * T, D))
-        x = x.view(B * T, 256, 4, 4)
-        for i, layer in enumerate(self.deconv_layers):
-            x = layer(x)
-            # Apply nonlinearity to all but the last layer
-            if i < len(self.deconv_layers) - 1:
-                x = F.elu(x)
-
-        # Final shape: (B,T,C,H,W)
-        C, H, W = x.size(1), x.size(2), x.size(3)
-        x = x.view(B, T, C, H, W)
-        loc = x
-        scale = torch.ones_like(x)
-        dist = Independent(Normal(loc, scale), len(self.output_shape))
-        return dist
+    def forward(self, x):
+        B, T, D = x.shape
+        # Project latent state to match ConvTranspose2d input shape
+        # print("Decoder input:", x.shape)
+        x = x.view(B * T, D)
+        x = self.fc(x)  # [B x T, 230] -> [B x T, 256 * 4 * 4]
+        # print("Decoder upscale:", x.shape)
+        x = x.view(B * T, 256, 4, 4)  # [B x T, 256, 4, 4]
+        x = self.deconvs(x)  # [B x T, 3, 64, 64]
+        mean = x.view(B, T, 3, 64, 64)  # [B, T, 3, 64, 64]
+        # Return a Normal distribution with fixed variance
+        # reinterpreted_batch_ndims=3 treats the last three dimensions (channels, height, width)
+        # as part of each independent event in the distribution.
+        # This means the distribution models independent pixel values, instead of treating
+        # each pixel as a separate batch.
+        return torch.distributions.Independent(
+            torch.distributions.Normal(mean, 1.0), reinterpreted_batch_ndims=3
+        )
 
 
 class TransitionDecoder(nn.Module):
     def __init__(
         self,
-        config,
         dist,
     ):
         super(TransitionDecoder, self).__init__()
         self.dist_type = dist
-        self.output_sizes = config.output_sizes
-        # print("Layer sizes:", self.output_sizes)
+        self.input_dim = 230
+        self.hidden_layers = [300, 300, 300]
         layers = []
-        input_dim = self.output_sizes[0]
-        for size in self.output_sizes[1:]:
-            layers.append(nn.Linear(input_dim, size))
+        prev_dim = self.input_dim
+        for size in self.hidden_layers:
+            layer = nn.Linear(prev_dim, size)
+            nn.init.xavier_uniform_(layer.weight, gain=nn.init.calculate_gain("relu"))
+            nn.init.zeros_(layer.bias)
+            layers.append(layer)
             layers.append(nn.ELU())
-            input_dim = size
+            prev_dim = size
+        layers.append(nn.Linear(size, 1))
         self.mlp = nn.Sequential(*layers)
 
     def forward(self, features):
-        # print(features.shape)
         B, T, D = features.shape
         x = features.view(B * T, D)
-        # print(x.shape)
         x = self.mlp(x)
-        x = x.view(B, T, self.output_sizes[-1])
+        x = x.view(B, T, 1)
 
         if self.dist_type == "normal":
-            loc = x
-            scale = torch.ones_like(x)
-            base_dist = Normal(loc, scale)
-            dist = Independent(base_dist, 0)
+            mu = x
+            std = torch.ones_like(x)
+            dist = Normal(mu, std)
+            dist = Independent(dist, 0)
         elif self.dist_type == "bernoulli":
             dist = Bernoulli(logits=x)
             dist = Independent(dist, 0)
@@ -143,12 +153,12 @@ class Prior(nn.Module):
     This allows "imagining" future states before we actually see them.
     """
 
-    def __init__(self, n_actions, config):
+    def __init__(self, n_actions):
         super(Prior, self).__init__()
-        self.stoch_size = config.rssm.stochastic_size
-        self.det_size = config.rssm.deterministic_size
-        self.hidden_size = config.rssm.hidden_size
-        self.input_shape = self.stoch_size + n_actions
+        self.stoch_size = 30
+        self.det_size = 200
+        self.hidden_size = 200
+        self.input_shape = self.stoch_size + int(n_actions)
         self.h1 = nn.Linear(self.input_shape, self.det_size)
         self.gru = nn.GRUCell(self.det_size, self.det_size)
         self.h2 = nn.Linear(self.det_size, self.hidden_size)
@@ -190,12 +200,12 @@ class Posterior(nn.Module):
     the next stochastic state that should match reality better than the prior alone.
     """
 
-    def __init__(self, config):
+    def __init__(self):
         super(Posterior, self).__init__()
-        self.stoch_size = config.rssm.stochastic_size
-        self.det_size = config.rssm.deterministic_size
-        self.hidden_size = config.rssm.hidden_size
-        self.obs_size = config.encoder.output_dim
+        self.stoch_size = 30
+        self.det_size = 200
+        self.hidden_size = 200
+        self.obs_size = 1024
         self.h1 = nn.Linear(self.obs_size + self.det_size, self.hidden_size)
         self.h2 = nn.Linear(self.hidden_size, self.stoch_size * 2)
 
@@ -222,13 +232,13 @@ class Posterior(nn.Module):
 
 
 class RSSM(nn.Module):
-    def __init__(self, n_actions, config):
+    def __init__(self, n_actions):
         super(RSSM, self).__init__()
-        self.prior = Prior(n_actions, config)
-        self.posterior = Posterior(config)
-        self.stoch_size = config.rssm.stochastic_size
-        self.det_size = config.rssm.deterministic_size
-        self.horizon = config.imag_horizon
+        self.prior = Prior(n_actions)
+        self.posterior = Posterior()
+        self.stoch_size = 30
+        self.det_size = 200
+        self.horizon = 15
 
     def forward(self, prev_state, prev_action, observation):
         # print("\nRSSM Embed shape: ", observation.shape, observation.dtype)
@@ -347,23 +357,18 @@ class RSSM(nn.Module):
 
 
 class WorldModel(nn.Module):
-    def __init__(
-        self,
-        obs_shape,
-        n_actions,
-        config,
-    ):
+    def __init__(self, n_actions, lr=6e-4, eps=1e-7):
         super(WorldModel, self).__init__()
-        self.encoder = ObservationEncoder(obs_shape, config.encoder)
-        self.decoder = ObservationDecoder(obs_shape, config.decoder)
-        self.reward = TransitionDecoder(config.reward, "normal")
-        self.terminal = TransitionDecoder(config.terminal, "bernoulli")
-        self.rssm = RSSM(n_actions, config)
+        self.encoder = ObservationEncoder()
+        self.decoder = ObservationDecoder()
+        self.reward = TransitionDecoder("normal")
+        self.terminal = TransitionDecoder("bernoulli")
+        self.rssm = RSSM(n_actions)
 
         self.optimizer = torch.optim.Adam(
             self.parameters(),
-            lr=float(config.model_opt.lr),
-            eps=float(config.model_opt.eps),
+            lr=float(lr),
+            eps=float(eps),
         )
 
     def forward(self, prev_state, prev_action, observation):
@@ -382,62 +387,59 @@ class WorldModel(nn.Module):
         return features, reward_dist, terminal_dist
 
     def observe(self, observations, actions):
+        # print("Obs shape:", observations.shape)
         encoded_obs = self.encoder(observations)
         # print("Encoded obs shape:", encoded_obs.shape)
         (prior, posterior), features = self.rssm.observe(encoded_obs, actions)
-        # print("State shape:", features.shape)
+        # print("Latent shape:", features.shape)
         reward_dist = self.reward(features)  # Normal distribution
         terminal_dist = self.terminal(features)  # Bernoulli distribution
         decoded_obs = self.decoder(features)  # Normal distribution
         return (prior, posterior), features, decoded_obs, reward_dist, terminal_dist
 
+    def decode(self, features):
+        return self.decoder(features)
+
 
 class Actor(nn.Module):
-    def __init__(self, action_space, config):
+    def __init__(self, action_space, lr=8e-5, eps=1e-7):
         super(Actor, self).__init__()
-        self.action_space = action_space
-        self.input_dim = config.rssm.stochastic_size + config.rssm.deterministic_size
-        self.min_stddev = float(config.actor.min_stddev)
-        self.hidden_sizes = config.actor.output_sizes
+        self.input_dim = 230
+        self.hidden_layers = [300, 300, 300]
 
-        self.init_layers()
-
-        self.optimizer = torch.optim.Adam(
-            self.parameters(), lr=float(config.actor.lr), eps=float(config.actor.eps)
-        )
-
-    def init_layers(self):
         # Determine if action space is continuous or discrete
         self.is_continuous = (
-            self.action_space.dtype == float and len(self.action_space.shape) == 1
+            action_space.dtype == float and len(action_space.shape) == 1
         )
         # If continuous, output mean and std for each action dimension
         # If discrete, output logits for each action dimension
-        if isinstance(
-            self.action_space, gym.spaces.Box
-        ):  # For continuous action spaces
-            self.action_dim = self.action_space.shape[0]
-            # We will produce mean and stddev for continuous actions
-            # So final layer dimension: action_dim * 2
-            self.final_out = self.action_dim * 2
+        if self.is_continuous:
+            # print("Continuous action space")
+            self.init_std = float(np.log(np.exp(5.0) - 1.0))
+            self.final_out = action_space.shape[0] * 2
+        elif isinstance(action_space, gym.spaces.Discrete):
+            # print("Discrete action space")
+            self.final_out = action_space.n
         else:
-            # Discrete action space: final_out = number of discrete actions
-            self.action_dim = self.action_space.n
-            self.final_out = self.action_dim
+            # print("Continuous action space")
+            self.init_std = float(np.log(np.exp(5.0) - 1.0))
+            self.final_out = action_space.shape[0] * 2
 
         layers = []
         prev_dim = self.input_dim
-        for size in self.hidden_sizes:
+        for size in self.hidden_layers:
             layer = nn.Linear(prev_dim, size)
+            nn.init.xavier_uniform_(layer.weight, gain=nn.init.calculate_gain("relu"))
+            nn.init.zeros_(layer.bias)
             layers.append(layer)
             layers.append(nn.ELU())
             prev_dim = size
         layers.append(nn.Linear(prev_dim, self.final_out))
         self.mlp = nn.Sequential(*layers)
 
-        # Precompute init_std for continuous actions
-        if self.is_continuous:
-            self.init_std = float(np.log(np.exp(5.0) - 1.0))
+        self.optimizer = torch.optim.Adam(
+            self.parameters(), lr=float(lr), eps=float(eps)
+        )
 
     def forward(self, x):
         x = self.mlp(x)
@@ -446,7 +448,7 @@ class Actor(nn.Module):
             half = x.size(-1) // 2
             mu = x[..., :half]
             stddev_param = x[..., half:]
-            stddev = F.softplus(stddev_param + self.init_std) + self.min_stddev
+            stddev = F.softplus(stddev_param + self.init_std) + 1e-6
             mean = 5.0 * torch.tanh(mu / 5.0)
             base_dist = Normal(mean, stddev)
             dist = TransformedDistribution(base_dist, [TanhTransform(cache_size=1)])
@@ -457,36 +459,33 @@ class Actor(nn.Module):
         return dist
 
 
-
-
 class Critic(nn.Module):
-    def __init__(self, config):
+    def __init__(self, lr=8e-5, eps=1e-7):
         super(Critic, self).__init__()
-        self.hidden_sizes = config.critic.output_sizes
-        self.input_dim = config.rssm.stochastic_size + config.rssm.deterministic_size
+        self.input_dim = 230
+        self.hidden_layers = [300, 300, 300]
 
-        self.init_layers()
-
-        self.optimizer = torch.optim.Adam(
-            self.parameters(), lr=float(config.critic.lr), eps=float(config.critic.eps)
-        )
-
-    def init_layers(self):
         layers = []
         prev_dim = self.input_dim
-        for size in self.hidden_sizes:
+        for size in self.hidden_layers:
             layer = nn.Linear(prev_dim, size)
+            nn.init.xavier_uniform_(layer.weight, gain=nn.init.calculate_gain("relu"))
+            nn.init.zeros_(layer.bias)
             layers.append(layer)
             layers.append(nn.ELU())
             prev_dim = size
 
         # Predict mean and stddev for a Normal distribution
         self.mean_layer = nn.Linear(prev_dim, 1)
-        self.std_layer = nn.Linear(prev_dim, 1) 
+        self.std_layer = nn.Linear(prev_dim, 1)
         self.mlp = nn.Sequential(*layers)
+
+        self.optimizer = torch.optim.Adam(
+            self.parameters(), lr=float(lr), eps=float(eps)
+        )
 
     def forward(self, x):
         x = self.mlp(x)
         mean = self.mean_layer(x)
         std = F.softplus(self.std_layer(x)) + 1e-6  # Ensure stddev is positive
-        return Independent(Normal(mean, std), 1)   # Create an Independent Normal distribution
+        return Independent(Normal(mean, std), 1)
