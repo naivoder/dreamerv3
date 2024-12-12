@@ -22,6 +22,7 @@ class Dreamer:
         self.discount = config.discount
         self.imag_horizon = config.imag_horizon
         self.path = f"weights/{config.task}"
+        self.update_interval = config.update_interval
         self.update_steps = config.update_steps
         self.action_repeat = config.action_repeat
         self.prefill = config.prefill
@@ -52,7 +53,7 @@ class Dreamer:
             if self.warmup_episodes:
                 return self.random_action()
 
-            if self.update_interval:
+            if self.time_to_learn:
                 self.learn()
 
         prev_state, prev_action = self.state
@@ -86,7 +87,7 @@ class Dreamer:
         # Sample action during training for exploration; use mode for evaluation.
         action = policy.sample() if training else policy.mode()
         # print("Dreamer Action:", action.shape)
-        return current_state, action.squeeze(0)
+        return current_state, action.unsqueeze(0)
 
     def learn(self):
         report = defaultdict(float)
@@ -254,7 +255,7 @@ class Dreamer:
         return self.step <= self.prefill
 
     @property
-    def update_interval(self):
+    def time_to_learn(self):
         return self.step % self.update_interval == 0
 
     def save_checkpoint(self):
