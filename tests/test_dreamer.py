@@ -9,6 +9,7 @@ from memory import ReplayBuffer
 from types import SimpleNamespace
 import yaml
 from unittest.mock import MagicMock
+import gym
 
 
 class Config:
@@ -78,7 +79,7 @@ class TestDreamer(unittest.TestCase):
                     "observation": torch.zeros((50, 5) + self.obs_shape),
                     "action": torch.zeros((50, 5) + self.act_space.shape),
                     "reward": torch.zeros((50, 5, 1)),
-                    "done": torch.zeros((50, 5, 1)),
+                    "terminal": torch.zeros((50, 5, 1)),
                 }
             ]
         )
@@ -86,15 +87,17 @@ class TestDreamer(unittest.TestCase):
 
     def test_remember(self):
         (stoch_, det_), act_ = self.dreamer.init_state()
-        observation = torch.zeros(self.obs_shape)
-        action = torch.zeros(self.act_space.shape)
-        action[0] += 1
-        reward = torch.tensor(0.0)
-        done = torch.tensor(False)
-        self.dreamer.remember(observation, action, reward, done)
+        transition = {
+            "observation": torch.zeros(self.obs_shape),
+            "action": torch.zeros(self.act_space.shape),
+            "reward": torch.tensor(0.0),
+            "terminal": torch.tensor(False),
+        }
+        transition["action"][0] += 1
+        self.dreamer.remember(transition)
         self.assertEqual(self.dreamer.step, 2)  # 2 because of action repeat
-        done = torch.tensor(True)
-        self.dreamer.remember(observation, action, reward, done)
+        transition["terminal"] = torch.tensor(True)
+        self.dreamer.remember(transition)
         self.assertEqual(self.dreamer.step, 4)
         (stoch, det), act = self.dreamer.state
         self.assertTrue(torch.equal(stoch, stoch_), "Mismatch in stochastic state")
@@ -104,6 +107,7 @@ class TestDreamer(unittest.TestCase):
     def test_save_and_load_checkpoint(self):
         # Save weights
         self.dreamer.save_checkpoint()
+
         # Modify weights
         for param in self.dreamer.world_model.parameters():
             param.data.add_(1.0)
@@ -111,6 +115,7 @@ class TestDreamer(unittest.TestCase):
             param.data.add_(1.0)
         for param in self.dreamer.critic.parameters():
             param.data.add_(1.0)
+
         # Load weights back
         self.dreamer.load_checkpoint()
 
