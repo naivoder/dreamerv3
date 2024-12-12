@@ -21,20 +21,20 @@ def do_episode(agent, training, environment, config, pbar, render):
     observation, _ = environment.reset()
 
     while not done:
-        action = agent(torch.tensor(observation, dtype=torch.float32), training)
+        action = agent(torch.tensor(observation, dtype=torch.float32).permute(2, 0, 1), training)
         next_observation, reward, term, trunc, info = environment.step(action)
-        terminal = term or trunc
+        done = term or trunc
 
         if training:
             agent.observe(
                 {
-                    "observation": torch.tensor(observation, dtype=torch.float32),
+                    "observation": torch.tensor(observation, dtype=torch.float32).permute(2, 0, 1),
                     "next_observation": torch.tensor(
                         next_observation, dtype=torch.float32
-                    ),
+                    ).permute(2, 0, 1),
                     "action": torch.tensor(action, dtype=torch.float32),
                     "reward": torch.tensor(reward, dtype=torch.float32),
-                    "terminal": torch.tensor(terminal, dtype=torch.float32),
+                    "terminal": torch.tensor(done, dtype=torch.float32),
                     "info": info,
                 }
             )
@@ -43,7 +43,7 @@ def do_episode(agent, training, environment, config, pbar, render):
         episode_summary["next_observation"].append(next_observation)
         episode_summary["action"].append(action)
         episode_summary["reward"].append(reward)
-        episode_summary["terminal"].append(terminal)
+        episode_summary["terminal"].append(done)
         episode_summary["info"].append(info)
 
         observation = next_observation
@@ -53,16 +53,17 @@ def do_episode(agent, training, environment, config, pbar, render):
         pbar.update(config.action_repeat)
         steps += config.action_repeat
 
+
     episode_summary["steps"] = [steps]
     return steps, episode_summary
 
 
 def interact(agent, environment, steps, config, training=True, on_episode_end=None):
-    pbar = tqdm(total=steps)
+    pbar = tqdm(total=int(float(steps)))
     steps_count = 0
     episodes = []
 
-    while steps_count < steps:
+    while steps_count < float(steps):
         episode_steps, episode_summary = do_episode(
             agent,
             training,

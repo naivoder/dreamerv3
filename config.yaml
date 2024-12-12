@@ -2,7 +2,7 @@ defaults:
   # Train Script
   log_dir: results
   seed: 0
-  task: pendulum.swingup
+  task: cartpole.balance
   time_limit: 1000
   action_repeat: 2
   steps: 1e6
@@ -13,7 +13,7 @@ defaults:
   update_steps: 100
   replay: { capacity: 1000, batch_size: 32, sequence_length: 50 }
   jit: True
-  render_episodes: 1
+  render_episodes: 0
   evaluate_model: True
   precision: 16
   initialization: glorot

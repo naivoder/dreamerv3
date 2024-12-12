@@ -159,8 +159,8 @@ class Prior(nn.Module):
         # Concatenate the previous action and the previous stochastic state.
         # This forms the input to the model for predicting the next latent state.
         # print("\nPrior Prev Action:", prev_action.shape)
-        # print("Stoch:", stoch)
         # print("Prior Stoch:", stoch.shape)
+        # print("Stoch:", stoch)
         cat = torch.cat([prev_action, stoch], dim=-1)
         # print("Prior Cat:", cat.shape)
         # print("Prior Input shape:", self.input_shape)
@@ -233,7 +233,7 @@ class RSSM(nn.Module):
     def forward(self, prev_state, prev_action, observation):
         # print("\nRSSM Embed shape: ", observation.shape, observation.dtype)
         # print("RSSM Prev state:", prev_state[0].shape, prev_state[1].shape)
-        # print("RSSM Prev action:", prev_action)
+        # print("RSSM Prev action:", prev_action.shape)
         prior, state = self.prior(prev_state, prev_action)
         posterior, state = self.posterior(state, observation)
         return (prior, posterior), state
@@ -254,15 +254,21 @@ class RSSM(nn.Module):
 
         stoch, det = torch.split(init_obs, [self.stoch_size, self.det_size], dim=-1)
         state = (stoch, det)
+        # print("\nImagine Stoch shape:", stoch.shape)
 
         # Loop through each step, predicting forward in time using the prior.
         for t in range(horizon):
             if actions is None:
                 with torch.no_grad():
                     dist = actor(torch.cat(state, dim=-1))
-                action = dist.rsample()
+                # Not handling this correctly, should be:
+                # action = dist.rsample()
+                # for continuous spaces
+                action = dist.sample()
             else:
                 action = actions[:, t]
+            action = action.unsqueeze(-1)
+            # print("Imagine Action shape:", action.shape)
             # Use the prior to predict the next state given current state & chosen action.
             _, state = self.prior(state, action)
             sequence[:, t] = torch.cat(state, dim=-1)
@@ -361,11 +367,11 @@ class WorldModel(nn.Module):
         )
 
     def forward(self, prev_state, prev_action, observation):
-        # print("\nWorld Obs shape: ", observation.shape, observation.dtype)
         encoded_obs = self.encoder(observation)
+        # print("\nWorld Obs shape: ", observation.shape, observation.dtype)
         # print("World Embed shape: ", encoded_obs.shape, encoded_obs.dtype)
         # print("World Prev state:", prev_state[0].shape, prev_state[1].shape)
-        # print("World Prev action:", prev_action)
+        # print("World Prev action:", prev_action.shape)
         (prior, posterior), state = self.rssm(prev_state, prev_action, encoded_obs)
         return (prior, posterior), state
 
@@ -451,6 +457,8 @@ class Actor(nn.Module):
         return dist
 
 
+
+
 class Critic(nn.Module):
     def __init__(self, config):
         super(Critic, self).__init__()
@@ -471,8 +479,14 @@ class Critic(nn.Module):
             layers.append(layer)
             layers.append(nn.ELU())
             prev_dim = size
-        layers.append(nn.Linear(prev_dim, 1))
+
+        # Predict mean and stddev for a Normal distribution
+        self.mean_layer = nn.Linear(prev_dim, 1)
+        self.std_layer = nn.Linear(prev_dim, 1) 
         self.mlp = nn.Sequential(*layers)
 
     def forward(self, x):
-        return self.mlp(x)
+        x = self.mlp(x)
+        mean = self.mean_layer(x)
+        std = F.softplus(self.std_layer(x)) + 1e-6  # Ensure stddev is positive
+        return Independent(Normal(mean, std), 1)   # Create an Independent Normal distribution

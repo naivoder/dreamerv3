@@ -34,10 +34,15 @@ def compute_lambda_values(
     discount: Discount factor for future rewards.
     lambda_: Parameter controlling the weighting between 1-step returns and bootstrap values.
     """
+    # print("next_values shape:", next_values.shape)
+    # print("rewards shape:", rewards.shape)
+    # print("terminals shape:", terminals.shape)
+
+
     # Initialize the lambda-returns with the bootstrap value.
     v_lambda = next_values[:, -1] * (1.0 - terminals[:, -1])
     horizon = next_values.shape[1]
-    lambda_values = np.empty_like(next_values)
+    lambda_values = torch.empty_like(next_values)
 
     for t in reversed(range(horizon)):
         td = (
@@ -45,7 +50,7 @@ def compute_lambda_values(
             + (1.0 - terminals[:, t]) * (1.0 - lambda_) * discount * next_values[:, t]
         )
         v_lambda = td + v_lambda * lambda_ * discount
-        lambda_values = lambda_values.at[:, t].set(v_lambda)
+        lambda_values[:, t] = v_lambda
     return lambda_values
 
 
@@ -54,7 +59,7 @@ def discount(factor, length):
     # This is used to scale rewards over multiple steps.
     d = np.cumprod(factor * np.ones((length - 1,)))
     d = np.concatenate([np.ones((1,)), d])
-    return d
+    return torch.tensor(d)
 
 
 def global_norm(grads):

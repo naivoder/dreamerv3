@@ -31,13 +31,14 @@ class ActionRepeat(Wrapper):
         self.repeat = repeat
 
     def step(self, action):
-        term, trunc = False, False
+        done = False
         total_reward = 0.0
         current_step = 0
-        while current_step < self.repeat and not term or trunc:
+        while current_step < self.repeat and not done:
             obs, reward, term, trunc, info = self.env.step(action)
             total_reward += reward
             current_step += 1
+            done = term or trunc
         return obs, total_reward, term, trunc, info  # noqa
 
 
