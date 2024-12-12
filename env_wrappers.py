@@ -54,7 +54,8 @@ class RenderedObservation(ObservationWrapper):
         image = Image.fromarray(image)
         if image.size != self._size:
             image = image.resize(self._size, Image.BILINEAR)
-        image = np.array(image, copy=False).moveaxis(2, 0)
+        image = np.moveaxis(np.array(image, copy=False), 2, 0)
+        assert image.shape == (3, 64, 64)
         image = np.clip(image, 0, 255).astype(np.float32)
         return preprocess(image)
 
