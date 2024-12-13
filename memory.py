@@ -1,7 +1,7 @@
 import torch
 import numpy as np
+from collections import deque
 import utils
-
 
 class ReplayBuffer:
     def __init__(self, config, device):
@@ -10,8 +10,9 @@ class ReplayBuffer:
         self.seq_length = config.sequence_length
         self.device = device
 
-        self.episodes = []
+        self.episodes = deque(maxlen=self.capacity)
 
+        # Temporary storage for the current episode
         self._ep = {"observation": [], "action": [], "reward": [], "done": []}
 
     def store(self, obs, act, rew, done):
@@ -20,16 +21,16 @@ class ReplayBuffer:
         self._ep["reward"].append(rew)
         self._ep["done"].append(done)
         if done:
+            # Convert lists to NumPy arrays
             ep = {k: np.array(v) for k, v in self._ep.items()}
-            ep["observation"] = utils.quantize(ep["observation"])
+            ep["observation"] = utils.quantize(ep["observation"])  
 
-            self.episodes.append(ep)
-            if len(self.episodes) > self.capacity:
-                self.episodes.pop(0)
+            self.episodes.append(ep) 
+            self._ep = {"observation": [], "action": [], "reward": [], "done": []}  # Reset for new episode
 
     def sample(self, n_batches):
         for _ in range(n_batches):
-            batch = {"observation": [], "action": [], "reward": [], "done": []}
+            batch = {k: [] for k in ["observation", "action", "reward", "done"]}
             for _ in range(self.batch_size):
                 ep = np.random.choice(self.episodes)
                 t = np.random.randint(len(ep["observation"]) - self.seq_length)
@@ -37,7 +38,7 @@ class ReplayBuffer:
                     batch[k].append(ep[k][t : t + self.seq_length])
 
             for k in batch.keys():
-                batch[k] = torch.tensor(np.array(batch[k]), device=self.device)
+                batch[k] = torch.tensor(np.array(batch[k]), device=self.device, requires_grad=False)
 
             batch["observation"] = utils.preprocess(batch["observation"])
             yield batch

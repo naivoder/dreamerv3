@@ -269,7 +269,7 @@ class RSSM(nn.Module):
         # Loop through each step, predicting forward in time using the prior.
         for t in range(horizon):
             if actions is None:
-                with torch.no_grad():
+                with torch.no_grad(): # is this equivalent to state.detach()? 
                     # print(type(actor))
                     dist = actor(torch.cat(state, dim=-1))
                 # Not handling this correctly, should be:

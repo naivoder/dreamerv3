@@ -29,22 +29,22 @@ def do_episode(agent, training, environment, config, pbar, render):
             agent.remember(
                 {
                     "observation": torch.tensor(observation, dtype=torch.float32),
-                    "next_observation": torch.tensor(
-                        next_observation, dtype=torch.float32
-                    ),
+                    # "next_observation": torch.tensor(
+                    #     next_observation, dtype=torch.float32
+                    # ),
                     "action": torch.tensor(action, dtype=torch.float32),
                     "reward": torch.tensor(reward, dtype=torch.float32),
                     "terminal": torch.tensor(done, dtype=torch.float32),
-                    "info": info,
+                    # "info": info,
                 }
             )
 
         episode_summary["observation"].append(observation)
-        episode_summary["next_observation"].append(next_observation)
+        # episode_summary["next_observation"].append(next_observation)
         episode_summary["action"].append(action)
         episode_summary["reward"].append(reward)
         episode_summary["terminal"].append(done)
-        episode_summary["info"].append(info)
+        # episode_summary["info"].append(info)
 
         observation = next_observation
         if render:
@@ -58,10 +58,10 @@ def do_episode(agent, training, environment, config, pbar, render):
 
 
 def interact(agent, environment, steps, config, training=True, on_episode_end=None):
-    pbar = tqdm(total=int(float(steps)))
     steps_count = 0
     episodes = []
 
+    pbar = tqdm(total=int(float(steps)), postfix=f"Episodes: {len(agent.memory)}")
     while steps_count < float(steps):
         episode_steps, episode_summary = do_episode(
             agent,
@@ -77,6 +77,7 @@ def interact(agent, environment, steps, config, training=True, on_episode_end=No
         if on_episode_end:
             on_episode_end(episode_summary, steps_count)
 
+        pbar.set_postfix_str(f"Episodes: {len(agent.memory)}")
     pbar.close()
     return steps, episodes
 
