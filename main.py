@@ -104,7 +104,7 @@ def evaluate(agent, train_env, config, steps):
             for episode in evaluation_episodes_summaries[: config.render_episodes]
         ]
         agent.logger.log_video(
-            np.array(videos, copy=False).transpose([0, 1, 4, 2, 3]),
+            np.asarray(videos).transpose([0, 1, 4, 2, 3]),
             steps,
             name="videos/overview",
         )
@@ -117,12 +117,12 @@ def evaluate(agent, train_env, config, steps):
             torch.tensor(
                 evaluation_episodes_summaries[0]["action"], dtype=torch.float32
             ),
-            agent.world_model,
-            agent.world_model.parameters(),
+            agent,
         )
         for vid, name in zip(more_videos, ("gt", "inferred", "generated")):
+            # print(vid.shape)
             agent.logger.log_video(
-                np.array(vid, copy=False).transpose([0, 1, 4, 2, 3]),
+                np.asarray(vid).transpose([0, 1, 4, 2, 3]),
                 steps,
                 name=f"videos/{name}",
             )
@@ -172,31 +172,34 @@ def train(config, agent, environment):
     return agent
 
 
-def evaluate_model(observations, actions, world_model):
+def evaluate_model(observations, actions, agent):
     length = min(len(observations) + 1, 50)
 
     observations = torch.tensor(observations, dtype=torch.float32)
     actions = torch.tensor(actions, dtype=torch.float32)
 
     with torch.no_grad():
-        _, features, inferred_decoded, *_ = world_model.observe_sequence(
-            observations[:length].unsqueeze(0),
-            actions[:length].unsqueeze(0),
+        _, features, inferred_decoded, *_ = agent.world_model.observe(
+            observations[:length].unsqueeze(0).cuda(),
+            actions[:length].unsqueeze(0).cuda(),
         )
+        # inferred_decoded = inferred_decoded.rsample()
+        # print(inferred_decoded.shape, inferred_decoded.type)
 
         conditioning_length = length // 5
 
-        generated, *_ = world_model.generate_sequence(
-            features[:, conditioning_length],
-            actions[conditioning_length:].unsqueeze(0),
+        generated, *_ = agent.world_model.imagine(
+            features[:, conditioning_length].cuda(),
+            actions=actions[conditioning_length:].unsqueeze(0).cuda(),
         )
 
-        generated_decoded = world_model.decode(generated)
-
+        generated_decoded = agent.world_model.decode(generated)
+        # generated_decoded = generated_decoded.rsample()
+        # print(generated_decoded.shape, generated_decoded.type)
         out = (
             observations[conditioning_length:length].unsqueeze(0),
-            inferred_decoded.mean(dim=0)[:, conditioning_length:length],
-            generated_decoded.mean(dim=0),
+            inferred_decoded.mean[:, conditioning_length:length].cpu(),
+            generated_decoded.mean.cpu(),
         )
 
         out = [((x + 0.5) * 255).clamp(0, 255).byte() for x in out]

@@ -168,7 +168,7 @@ class Prior(nn.Module):
         stoch, det = prev_state
         # Concatenate the previous action and the previous stochastic state.
         # This forms the input to the model for predicting the next latent state.
-        # print("\nPrior Prev Action:", prev_action.shape)
+        # print("Prior Prev Action:", prev_action.shape)
         # print("Prior Stoch:", stoch.shape)
         # print("Stoch:", stoch)
         cat = torch.cat([prev_action, stoch], dim=-1)
@@ -248,7 +248,7 @@ class RSSM(nn.Module):
         posterior, state = self.posterior(state, observation)
         return (prior, posterior), state
 
-    def imagine(self, init_obs, actor, actions=None):
+    def imagine(self, init_obs, actor=None, actions=None):
         """
         Using the prior model, we can "imagine" future states without seeing observations.
         This is useful for planning or training policies purely in latent space.
@@ -270,14 +270,15 @@ class RSSM(nn.Module):
         for t in range(horizon):
             if actions is None:
                 with torch.no_grad():
+                    # print(type(actor))
                     dist = actor(torch.cat(state, dim=-1))
                 # Not handling this correctly, should be:
                 # action = dist.rsample()
                 # for continuous spaces
-                action = dist.sample()
+                action = dist.rsample()
             else:
                 action = actions[:, t]
-            action = action.unsqueeze(-1)
+            # action = action.unsqueeze(-1)
             # print("Imagine Action shape:", action.shape)
             # Use the prior to predict the next state given current state & chosen action.
             _, state = self.prior(state, action)
@@ -380,7 +381,8 @@ class WorldModel(nn.Module):
         (prior, posterior), state = self.rssm(prev_state, prev_action, encoded_obs)
         return (prior, posterior), state
 
-    def imagine(self, initial_features, actor, actions=None):
+    def imagine(self, initial_features, actor=None, actions=None):
+        # print(type(actor))
         features = self.rssm.imagine(initial_features, actor, actions)
         reward_dist = self.reward(features)  # Normal distribution
         terminal_dist = self.terminal(features)  # Bernoulli distribution
@@ -402,28 +404,22 @@ class WorldModel(nn.Module):
 
 
 class Actor(nn.Module):
-    def __init__(self, action_space, lr=8e-5, eps=1e-7):
+    def __init__(self, n_actions, is_continuous, lr=8e-5, eps=1e-7):
         super(Actor, self).__init__()
         self.input_dim = 230
         self.hidden_layers = [300, 300, 300]
+        self.is_continuous = is_continuous
 
-        # Determine if action space is continuous or discrete
-        self.is_continuous = (
-            action_space.dtype == float and len(action_space.shape) == 1
-        )
         # If continuous, output mean and std for each action dimension
         # If discrete, output logits for each action dimension
         if self.is_continuous:
             # print("Continuous action space")
             self.init_std = float(np.log(np.exp(5.0) - 1.0))
-            self.final_out = action_space.shape[0] * 2
-        elif isinstance(action_space, gym.spaces.Discrete):
+            self.final_out = n_actions * 2
+        else: 
+            # isinstance(action_space, gym.spaces.Discrete):
             # print("Discrete action space")
-            self.final_out = action_space.n
-        else:
-            # print("Continuous action space")
-            self.init_std = float(np.log(np.exp(5.0) - 1.0))
-            self.final_out = action_space.shape[0] * 2
+            self.final_out = n_actions
 
         layers = []
         prev_dim = self.input_dim
@@ -450,8 +446,8 @@ class Actor(nn.Module):
             stddev_param = x[..., half:]
             stddev = F.softplus(stddev_param + self.init_std) + 1e-6
             mean = 5.0 * torch.tanh(mu / 5.0)
-            base_dist = Normal(mean, stddev)
-            dist = TransformedDistribution(base_dist, [TanhTransform(cache_size=1)])
+            dist = Normal(mean, stddev)
+            # dist = TransformedDistribution(dist, [TanhTransform(cache_size=1)])
             dist = Independent(dist, 1)
         else:
             dist = Categorical(logits=x)

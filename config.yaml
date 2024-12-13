@@ -8,10 +8,10 @@ defaults:
   steps: 1e6
   training_steps_per_epoch: 2.5e4
   evaluation_steps_per_epoch: 1e4
-  prefill: 5000 # 5000
+  prefill: 5000
   update_interval: 1000
   update_steps: 100
-  replay: { capacity: 1000, batch_size: 32, sequence_length: 50 }
+  replay: { capacity: 1000, batch_size: 50, sequence_length: 50 }
   jit: True
   render_episodes: 0
   evaluate_model: True

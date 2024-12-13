@@ -29,8 +29,10 @@ class Dreamer:
         self.free_nats = torch.tensor(config.free_nats).to(self.device)
 
         if isinstance(act_space, gym.spaces.Discrete):  # For discrete action spaces
+            self.is_continuous = False
             self.n_actions = act_space.n
         else:  # For continuous action spaces / if isinstance(act_space, gym.spaces.Box)
+            self.is_continuous = True
             self.n_actions = act_space.shape[0]
 
         # print("Number of Actions: ", self.n_actions, type(self.n_actions))
@@ -39,7 +41,7 @@ class Dreamer:
         self.random_action = lambda: act_space.sample()
 
         self.world_model = networks.WorldModel(self.n_actions).to(self.device)
-        self.actor = networks.Actor(act_space).to(self.device)
+        self.actor = networks.Actor(self.n_actions, self.is_continuous).to(self.device)
         self.critic = networks.Critic().to(self.device)
 
         self.memory = ReplayBuffer(config.replay, self.device)
@@ -56,11 +58,12 @@ class Dreamer:
             if self.time_to_learn:
                 self.learn()
 
-        prev_state, prev_action = self.state
-        state, action = self.act(prev_state, prev_action, obs, training)
-        self.state = state, action
+        with torch.no_grad():
+            prev_state, prev_action = self.state
+            state, action = self.act(prev_state, prev_action, obs, training)
+            self.state = state, action
 
-        return np.clip(action.squeeze().cpu().numpy(), self.act_low, self.act_high)
+            return np.clip(action.squeeze().cpu().numpy(), self.act_low, self.act_high)
 
     def init_state(self):
         stoch = torch.zeros(1, self.stoch_size).to(self.device)
@@ -83,11 +86,13 @@ class Dreamer:
 
         # Compute action distribution
         policy = self.actor(features)
+        # print(type(policy))
 
         # Sample action during training for exploration; use mode for evaluation.
-        action = policy.sample() if training else policy.mode()
+        action = policy.sample() if training else policy.mode
+        # action = action.unsqueeze(0)
         # print("Dreamer Action:", action.shape)
-        return current_state, action.unsqueeze(0)
+        return current_state, action
 
     def learn(self):
         report = defaultdict(float)
@@ -124,6 +129,8 @@ class Dreamer:
         act = batch["action"]
         rew = batch["reward"]
         done = batch["done"]
+        # print("Obs Shape:", obs.shape)
+        # print("Update Batch - Act Shape:", act.shape)
 
         (prior, posterior), features, decoded, reward, terminal = (
             self.world_model.observe(obs, act)
@@ -200,12 +207,12 @@ class Dreamer:
         grad_norm = utils.global_norm([p.grad for p in self.actor.parameters()])
         self.actor.optimizer.step()
 
-        entropy = self.actor(features[:, 0]).entropy().mean()
+        # entropy = self.actor(features[:, 0]).entropy().mean()
 
         metrics = {
             "agent/actor/loss": loss,
             "agent/actor/grad_norm": grad_norm,
-            "agent/actor/entropy": entropy,
+            # "agent/actor/entropy": entropy,
         }
 
         return metrics, imag_feats, lambda_values
