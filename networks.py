@@ -189,7 +189,7 @@ class Prior(nn.Module):
         dist = torch.distributions.Independent(
             torch.distributions.Normal(mean, stddev), 1
         )
-        stoch = dist.rsample()
+        stoch = dist.sample()
         return dist, (stoch, det)
 
 
@@ -227,7 +227,7 @@ class Posterior(nn.Module):
             torch.distributions.Normal(mean, stddev), 1
         )
         # Sample the refined stochastic state from the posterior.
-        stoch = dist.rsample()
+        stoch = dist.sample()
         return dist, (stoch, det)
 
 
@@ -269,13 +269,10 @@ class RSSM(nn.Module):
         # Loop through each step, predicting forward in time using the prior.
         for t in range(horizon):
             if actions is None:
-                with torch.no_grad(): # is this equivalent to state.detach()? 
+                # with torch.no_grad(): # is this equivalent to state.detach()? 
                     # print(type(actor))
-                    dist = actor(torch.cat(state, dim=-1))
-                # Not handling this correctly, should be:
-                # action = dist.rsample()
-                # for continuous spaces
-                action = dist.rsample()
+                dist = actor(torch.cat(state, dim=-1))
+                action = dist.sample()
             else:
                 action = actions[:, t]
             # action = action.unsqueeze(-1)
