@@ -187,11 +187,11 @@ class Dreamer:
             flat_feats, self.actor
         )
 
-        rewards = rewards_dist.rsample()  # Use .sample() for stochastic updates
-        terminals = terminals_dist.sample()
+        rewards = rewards_dist.mean  # Use .sample() for stochastic updates
+        terminals = terminals_dist.mean
         next_values = self.critic(
             imag_feats[:, 1:]
-        ).rsample()  # Extract value estimates
+        ).mean  # Extract value estimates
 
         # Compute lambda-returns
         lambda_values = utils.compute_lambda_values(
@@ -207,12 +207,15 @@ class Dreamer:
         grad_norm = utils.global_norm([p.grad for p in self.actor.parameters()])
         self.actor.optimizer.step()
 
-        # entropy = self.actor(features[:, 0]).entropy().mean()
+        dist = self.actor(features[:, 0])
+        entropy = dist.entropy().mean()
+
+        # might need to take abs value in grad norm to compensate for negatives? 
 
         metrics = {
             "agent/actor/loss": loss,
             "agent/actor/grad_norm": grad_norm,
-            # "agent/actor/entropy": entropy,
+            "agent/actor/entropy": entropy,
         }
 
         return metrics, imag_feats, lambda_values
