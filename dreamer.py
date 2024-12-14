@@ -89,10 +89,16 @@ class Dreamer:
         # print(type(policy))
 
         # Sample action during training for exploration; use mode for evaluation.
-        action = policy.sample() if training else policy.mode
+        action = policy.sample() if training else self._transformed_mode(policy)
         # action = action.unsqueeze(0)
         # print("Dreamer Action:", action.shape)
         return current_state, action
+    
+    def _transformed_mode(self, policy):
+        mode = policy.base_dist.mean
+        for t in policy.transforms:
+            mode = t(mode)
+        return mode
 
     def learn(self):
         report = defaultdict(float)
@@ -208,7 +214,7 @@ class Dreamer:
         self.actor.optimizer.step()
 
         dist = self.actor(features[:, 0])
-        entropy = dist.entropy().mean()
+        entropy = self._transformed_entropy(dist)
 
         # might need to take abs value in grad norm to compensate for negatives? 
 
@@ -219,6 +225,19 @@ class Dreamer:
         }
 
         return metrics, imag_feats, lambda_values
+    
+    def _transformed_entropy(self, dist, num_samples=100):
+        base_dist = dist.base_dist
+        samples = base_dist.base_dist.sample((num_samples,))
+        transformed_samples = base_dist.transforms[0](samples)
+        log_probs = base_dist.log_prob(transformed_samples)
+        
+        # Compute the log-det-Jacobian term
+        log_det_jacobian = torch.log(1 - transformed_samples.pow(2) + 1e-6)
+        
+        entropy = -log_probs - log_det_jacobian
+
+        return entropy.mean()
 
     def update_critic(self, features, lambda_values):
         """
@@ -228,6 +247,7 @@ class Dreamer:
         """
         values = self.critic(features[:, :-1])
         discount = utils.discount(self.discount, self.imag_horizon - 1)
+        entropy = values.entropy().mean()
 
         # print("Values:",values.shape)
         # print("Targets:", targets.shape)
@@ -243,6 +263,7 @@ class Dreamer:
         metrics = {
             "agent/critic/loss": loss,
             "agent/critic/grad_norm": grad_norm,
+            "agent/critic/entropy": entropy
         }
 
         return metrics

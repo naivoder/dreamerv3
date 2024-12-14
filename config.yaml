@@ -13,7 +13,7 @@ defaults:
   update_steps: 100
   replay: { capacity: 1000, batch_size: 50, sequence_length: 50 }
   jit: True
-  render_episodes: 0
+  render_episodes: 1
   evaluate_model: True
   precision: 16
   initialization: glorot
