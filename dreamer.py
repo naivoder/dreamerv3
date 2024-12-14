@@ -88,15 +88,17 @@ class Dreamer:
         policy = self.actor(features)
         # print(type(policy))
 
+        # This one might need to be sample()
         # Sample action during training for exploration; use mode for evaluation.
-        action = policy.rsample() if training else self._transformed_mode(policy)
+        # action = policy.rsample() if training else self._transformed_mode(policy)
+        action = policy.rsample() if training else policy.mode
         # action = action.unsqueeze(0)
         # print("Dreamer Action:", action.shape)
         return current_state, action
     
     def _transformed_mode(self, policy):
-        mode = policy.base_dist.mean
-        for t in policy.transforms:
+        mode = policy.base_dist.base_dist.mean
+        for t in policy.base_dist.transforms:
             mode = t(mode)
         return mode
 
@@ -214,7 +216,8 @@ class Dreamer:
         self.actor.optimizer.step()
 
         dist = self.actor(features[:, 0])
-        entropy = self._transformed_entropy(dist)
+        entropy = dist.entropy().mean()
+        # entropy = self._transformed_entropy(dist)
 
         # might need to take abs value in grad norm to compensate for negatives? 
 
