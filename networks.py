@@ -189,7 +189,7 @@ class Prior(nn.Module):
         dist = torch.distributions.Independent(
             torch.distributions.Normal(mean, stddev), 1
         )
-        stoch = dist.sample()
+        stoch = dist.rsample()
         return dist, (stoch, det)
 
 
@@ -227,7 +227,7 @@ class Posterior(nn.Module):
             torch.distributions.Normal(mean, stddev), 1
         )
         # Sample the refined stochastic state from the posterior.
-        stoch = dist.sample()
+        stoch = dist.rsample()
         return dist, (stoch, det)
 
 

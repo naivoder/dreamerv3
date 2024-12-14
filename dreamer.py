@@ -228,7 +228,7 @@ class Dreamer:
     
     def _transformed_entropy(self, dist, num_samples=100):
         base_dist = dist.base_dist
-        samples = base_dist.base_dist.rsample((num_samples,))
+        samples = base_dist.base_dist.sample((num_samples,))
         transformed_samples = base_dist.transforms[0](samples)
         log_probs = base_dist.log_prob(transformed_samples)
         
