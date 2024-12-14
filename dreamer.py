@@ -89,7 +89,7 @@ class Dreamer:
         # print(type(policy))
 
         # Sample action during training for exploration; use mode for evaluation.
-        action = policy.sample() if training else self._transformed_mode(policy)
+        action = policy.rsample() if training else self._transformed_mode(policy)
         # action = action.unsqueeze(0)
         # print("Dreamer Action:", action.shape)
         return current_state, action
@@ -228,7 +228,7 @@ class Dreamer:
     
     def _transformed_entropy(self, dist, num_samples=100):
         base_dist = dist.base_dist
-        samples = base_dist.base_dist.sample((num_samples,))
+        samples = base_dist.base_dist.rsample((num_samples,))
         transformed_samples = base_dist.transforms[0](samples)
         log_probs = base_dist.log_prob(transformed_samples)
         
