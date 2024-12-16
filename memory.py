@@ -15,12 +15,16 @@ class ReplayBuffer:
         # Temporary storage for the current episode
         self._ep = {"observation": [], "action": [], "reward": [], "done": []}
 
-    def store(self, obs, act, rew, done):
+    def store(self, obs, act, rew, next_obs, done):
         self._ep["observation"].append(obs)
         self._ep["action"].append(act)
         self._ep["reward"].append(rew)
         self._ep["done"].append(done)
+        
         if done:
+            # Add bootstrap observation
+            self._ep["observation"].append(next_obs)
+
             # Convert lists to NumPy arrays
             ep = {k: np.array(v) for k, v in self._ep.items()}
             ep["observation"] = utils.quantize(ep["observation"])  
