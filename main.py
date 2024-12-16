@@ -29,9 +29,9 @@ def do_episode(agent, training, environment, config, pbar, render):
             agent.remember(
                 {
                     "observation": torch.tensor(observation, dtype=torch.float32),
-                    # "next_observation": torch.tensor(
-                    #     next_observation, dtype=torch.float32
-                    # ),
+                    "next_observation": torch.tensor(
+                        next_observation, dtype=torch.float32
+                    ),
                     "action": torch.tensor(action, dtype=torch.float32),
                     "reward": torch.tensor(reward, dtype=torch.float32),
                     "terminal": torch.tensor(done, dtype=torch.float32),
