@@ -1,9 +1,11 @@
 from tensorboardX import SummaryWriter
-
+import os
 
 class TrainingLogger:
-    def __init__(self, log_dir):
-        self._writer = SummaryWriter(log_dir)
+    def __init__(self, log_dir, task):
+        save_dir = os.path.join(log_dir, "_".join(task.split(".")))
+        os.makedirs(save_dir, exist_ok=True)
+        self._writer = SummaryWriter(save_dir)
 
     def log_evaluation_summary(self, summary, step):
         for k, v in summary.items():
