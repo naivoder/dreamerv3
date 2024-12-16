@@ -211,7 +211,7 @@ class Posterior(nn.Module):
 
     def forward(self, prev_state, observation):
         _, det = prev_state
-        observation = observation.squeeze(1)
+        # observation = observation.squeeze(1) # should not need to do this...
         # Concatenate the deterministic state and the current observation.
         # This gives the model direct "evidence" from the new observation.
         # print("\nPosterior Det:", det.shape)
@@ -269,7 +269,7 @@ class RSSM(nn.Module):
         # Loop through each step, predicting forward in time using the prior.
         for t in range(horizon):
             if actions is None:
-                dist = actor(torch.cat(state, dim=-1))
+                dist = actor(torch.cat(state.detach(), dim=-1))
                 action = dist.rsample() # maybe this needs to be rsample? 
             else:
                 action = actions[:, t]
@@ -331,18 +331,9 @@ class RSSM(nn.Module):
             means = torch.stack([m for (m, _) in dists], dim=1)  # [B,T,D]
             stds = torch.stack([s for (_, s) in dists], dim=1)  # [B,T,D]
 
-            # We have [B,T,D], treat T and D as event dimensions.
-            # reinterpreted_batch_ndims=2:
-            # - By default, Normal is over [B,T,D]. B is batch, T,D are also batch dims.
-            # - We want B as batch, and (T,D) as event. So we must re-interpret two dims as event dims.
-            # However, PyTorch distributions only allow event dimensions at the end.
-            # Current shape: [B,T,D]. B is batch, T and D are "batch" as well.
-            # We want a single joint distribution for each element in B over T,D.
-            # That means the last two dims (T,D) are event dims.
-            # reinterpreted_batch_ndims counts from the right. For shape [B,T,D], B=batch_dim0, T=batch_dim1, D=batch_dim2.
-            # We want to interpret T,D as event => 2 event dims from the right.
+
             dist = torch.distributions.Independent(
-                torch.distributions.Normal(means, stds), reinterpreted_batch_ndims=2
+                torch.distributions.Normal(means, stds), 1
             )
             return dist
 
