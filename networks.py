@@ -457,9 +457,7 @@ class Critic(nn.Module):
             layers.append(nn.ELU())
             prev_dim = size
 
-        # Predict mean and stddev for a Normal distribution
         self.mean_layer = nn.Linear(prev_dim, 1)
-        self.std_layer = nn.Linear(prev_dim, 1)
         self.mlp = nn.Sequential(*layers)
 
         self.optimizer = torch.optim.Adam(
@@ -468,6 +466,10 @@ class Critic(nn.Module):
 
     def forward(self, x):
         x = self.mlp(x)
-        mean = self.mean_layer(x)
-        std = F.softplus(self.std_layer(x)) + 1e-6  # Ensure stddev is positive
-        return Independent(Normal(mean, std), 1)
+        mean = self.mean_layer(x)  # [B,T,1]
+        # mean = mean.squeeze(-1)    # [B,T]
+        
+        std = torch.ones_like(mean)  
+        
+        return Normal(mean, std)
+
