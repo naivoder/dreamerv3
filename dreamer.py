@@ -58,10 +58,10 @@ class Dreamer:
             if self.time_to_learn:
                 self.learn()
 
-        # with torch.no_grad():
-        prev_state, prev_action = self.state
-        state, action = self.act(prev_state, prev_action, obs, training)
-        self.state = state, action
+        with torch.no_grad():
+            prev_state, prev_action = self.state
+            state, action = self.act(prev_state, prev_action, obs, training)
+            self.state = state, action
 
         return np.clip(action.squeeze().cpu().numpy(), self.act_low, self.act_high)
 
@@ -90,8 +90,8 @@ class Dreamer:
 
         # This one might need to be sample()
         # Sample action during training for exploration; use mode for evaluation.
-        # action = policy.rsample() if training else self._transformed_mode(policy)
-        action = policy.sample() if training else policy.mode
+        action = policy.sample() if training else self._transformed_mode(policy)
+        # action = policy.sample() if training else policy.mode
         # action = action.unsqueeze(0)
         # print("Dreamer Action:", action.shape)
         return current_state, action
@@ -216,8 +216,8 @@ class Dreamer:
         self.actor.optimizer.step()
 
         dist = self.actor(features[:, 0])
-        entropy = dist.entropy().mean()
-        # entropy = self._transformed_entropy(dist)
+        # entropy = dist.entropy().mean()
+        entropy = self._transformed_entropy(dist)
 
         # might need to take abs value in grad norm to compensate for negatives? 
 

@@ -442,7 +442,7 @@ class Actor(nn.Module):
             stddev = F.softplus(stddev_param + self.init_std) + 1e-6
             mean = 5.0 * torch.tanh(mu / 5.0)
             dist = Normal(mean, stddev)
-            # dist = TransformedDistribution(dist, [TanhTransform(cache_size=1)])
+            dist = TransformedDistribution(dist, [TanhTransform(cache_size=1)])
             dist = Independent(dist, 1)
         else:
             dist = Categorical(logits=x)
