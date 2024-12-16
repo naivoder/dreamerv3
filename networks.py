@@ -211,7 +211,7 @@ class Posterior(nn.Module):
 
     def forward(self, prev_state, observation):
         _, det = prev_state
-        # observation = observation.squeeze(1) # should not need to do this...
+        observation = observation.squeeze(1) # should not need to do this...
         # Concatenate the deterministic state and the current observation.
         # This gives the model direct "evidence" from the new observation.
         # print("\nPosterior Det:", det.shape)
@@ -269,7 +269,7 @@ class RSSM(nn.Module):
         # Loop through each step, predicting forward in time using the prior.
         for t in range(horizon):
             if actions is None:
-                dist = actor(torch.cat(state.detach(), dim=-1))
+                dist = actor(torch.cat((stoch.detach(), det.detach()), dim=-1))
                 action = dist.rsample() # maybe this needs to be rsample? 
             else:
                 action = actions[:, t]
