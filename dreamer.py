@@ -45,10 +45,16 @@ class Dreamer:
         self.critic = networks.Critic().to(self.device)
 
         self.memory = ReplayBuffer(config.replay, self.device)
-        self.logger = TrainingLogger(config.log_dir)
+        self.logger = TrainingLogger(config.log_dir, config.task)
 
         self.state = self.init_state()
         self.step = 0
+
+    def init_state(self):
+        stoch = torch.zeros(1, self.stoch_size).to(self.device)
+        det = torch.zeros(1, self.det_size).to(self.device)
+        action = torch.zeros((1, self.n_actions)).to(self.device)
+        return (stoch, det), action
 
     def __call__(self, obs, training=True):
         if training:
@@ -63,12 +69,6 @@ class Dreamer:
         self.state = state, action
 
         return np.clip(action.squeeze().cpu().numpy(), self.act_low, self.act_high)
-
-    def init_state(self):
-        stoch = torch.zeros(1, self.stoch_size).to(self.device)
-        det = torch.zeros(1, self.det_size).to(self.device)
-        action = torch.zeros((1, self.n_actions)).to(self.device)
-        return (stoch, det), action
 
     @torch.no_grad()
     def act(self, prev_state, prev_action, obs, training=True):
@@ -89,11 +89,16 @@ class Dreamer:
         # print(type(policy))
 
         # Sample action during training for exploration; use mode for evaluation.
-        action = policy.rsample() if training else self._transformed_mode(policy)
+        action = policy.rsample() if training else self._mode(policy)
         # action = policy.sample() if training else policy.mode
         # action = action.unsqueeze(0)
         # print("Dreamer Action:", action.shape)
         return current_state, action
+    
+    def _mode(self, policy):
+        sample = policy.sample((100, ))
+        logprob = policy.log_prob(sample)
+        return sample[torch.argmax(logprob, 0).squeeze()]
     
     def _transformed_mode(self, policy):
         mode = policy.base_dist.base_dist.mean
@@ -216,7 +221,10 @@ class Dreamer:
 
         dist = self.actor(features[:, 0])
         # entropy = dist.entropy().mean()
-        entropy = self._transformed_entropy(dist)
+        # entropy = self._transformed_entropy(dist)
+        samples = dist.sample((100,))
+        entropy = dist.log_prob(samples).mean()
+
 
         # might need to take abs value in grad norm to compensate for negatives? 
 
@@ -273,11 +281,12 @@ class Dreamer:
     def remember(self, transition):
         # print("Observing")
         obs = transition["observation"]
+        next_obs = transition["next_observation"]
         act = transition["action"]
         rew = transition["reward"]
         done = transition["terminal"]
 
-        self.memory.store(obs, act, rew, done)
+        self.memory.store(obs, act, rew, next_obs, done)
         if done:
             self.state = self.init_state()
 
