@@ -89,8 +89,8 @@ class Dreamer:
         # print(type(policy))
 
         # Sample action during training for exploration; use mode for evaluation.
-        # action = policy.sample() if training else self._mode(policy)
-        action = policy.sample() if training else policy.mode
+        action = policy.sample() if training else self._mode(policy)
+        # action = policy.sample() if training else policy.mode
         # action = action.unsqueeze(0)
         # print("Dreamer Action:", action.shape)
         return current_state, action
@@ -220,10 +220,10 @@ class Dreamer:
         self.actor.optimizer.step()
 
         dist = self.actor(features[:, 0])
-        entropy = dist.entropy().mean()
+        # entropy = dist.entropy().mean()
         # entropy = self._transformed_entropy(dist)
-        # samples = dist.sample((100,))
-        # entropy = dist.log_prob(samples).mean()
+        samples = dist.sample((100,))
+        entropy = dist.log_prob(samples).mean()
 
         metrics = {
             "agent/actor/loss": loss,
@@ -254,7 +254,7 @@ class Dreamer:
         """
         values = self.critic(features[:, :-1])
         discount = utils.discount(self.discount, self.imag_horizon - 1)
-        entropy = values.entropy().mean()
+        # entropy = values.entropy().mean()
 
         # print("Values:",values.shape)
         # print("Targets:", targets.shape)
@@ -270,7 +270,7 @@ class Dreamer:
         metrics = {
             "agent/critic/loss": loss,
             "agent/critic/grad_norm": grad_norm,
-            "agent/critic/entropy": entropy
+            # "agent/critic/entropy": entropy
         }
 
         return metrics
