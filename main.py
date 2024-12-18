@@ -209,8 +209,21 @@ def evaluate_model(observations, actions, agent):
 
 
 if __name__ == "__main__":
-    config = Config.load_from_yaml("config.yaml")
-    env = env_wrappers.make_env(config)
-    agent = Dreamer(env.observation_space.shape, env.action_space, config)
+    from dm_control import suite
 
-    train(config, agent, env)
+    config = Config.load_from_yaml("config.yaml")
+    
+    for domain, task in suite.BENCHMARKING:
+        config.task = f"{domain}.{task}"
+        env = env_wrappers.make_env(config)
+        agent = Dreamer(env.observation_space.shape, env.action_space, config)
+
+        print("\nENVIRONMENT:", config.task.upper())
+        train(config, agent, env)
+
+    # config = Config.load_from_yaml("config.yaml")
+    # env = env_wrappers.make_env(config)
+    # agent = Dreamer(env.observation_space.shape, env.action_space, config)
+
+    # print("\nENVIRONMENT:", config.task.upper())
+    # train(config, agent, env)

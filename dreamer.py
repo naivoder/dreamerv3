@@ -89,8 +89,8 @@ class Dreamer:
         # print(type(policy))
 
         # Sample action during training for exploration; use mode for evaluation.
-        action = policy.rsample() if training else self._mode(policy)
-        # action = policy.sample() if training else policy.mode
+        # action = policy.sample() if training else self._mode(policy)
+        action = policy.sample() if training else policy.mode
         # action = action.unsqueeze(0)
         # print("Dreamer Action:", action.shape)
         return current_state, action
@@ -194,16 +194,16 @@ class Dreamer:
         """
         flat_feats = features.view(-1, features.shape[-1])
 
-        # Generate imaginary futures using the actor
+        # Generate imaginary futures using the actor and world model
         imag_feats, rewards_dist, terminals_dist = self.world_model.imagine(
             flat_feats, self.actor
         )
 
-        rewards = rewards_dist.mean  # Use .sample() for stochastic updates
+        rewards = rewards_dist.mean  
         terminals = terminals_dist.mean
-        next_values = self.critic(
-            imag_feats[:, 1:]
-        ).mean  # Extract value estimates
+
+        # Estimate value of imagined states
+        next_values = self.critic(imag_feats[:, 1:]).mean 
 
         # Compute lambda-returns
         lambda_values = utils.compute_lambda_values(
@@ -220,13 +220,10 @@ class Dreamer:
         self.actor.optimizer.step()
 
         dist = self.actor(features[:, 0])
-        # entropy = dist.entropy().mean()
+        entropy = dist.entropy().mean()
         # entropy = self._transformed_entropy(dist)
-        samples = dist.sample((100,))
-        entropy = dist.log_prob(samples).mean()
-
-
-        # might need to take abs value in grad norm to compensate for negatives? 
+        # samples = dist.sample((100,))
+        # entropy = dist.log_prob(samples).mean()
 
         metrics = {
             "agent/actor/loss": loss,

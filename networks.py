@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions.transforms import TanhTransform
+from torch.distributions import constraints
+from torch.distributions.transforms import Transform
 from torch.distributions import (
     Normal,
     Independent,
@@ -411,7 +413,7 @@ class Actor(nn.Module):
         prev_dim = self.input_dim
         for size in self.hidden_layers:
             layer = nn.Linear(prev_dim, size)
-            nn.init.xavier_uniform_(layer.weight, gain=nn.init.calculate_gain("relu"))
+            nn.init.xavier_uniform_(layer.weight)
             nn.init.zeros_(layer.bias)
             layers.append(layer)
             layers.append(nn.ELU())
@@ -433,7 +435,7 @@ class Actor(nn.Module):
             stddev = F.softplus(stddev_param + self.init_std) + 1e-6
             mean = 5.0 * torch.tanh(mu / 5.0)
             dist = Normal(mean, stddev)
-            dist = TransformedDistribution(dist, [TanhTransform(cache_size=1)])
+            # dist = TransformedDistribution(dist, [TanhTransform(cache_size=1)])
             dist = Independent(dist, 1)
         else:
             dist = Categorical(logits=x)
@@ -451,7 +453,7 @@ class Critic(nn.Module):
         prev_dim = self.input_dim
         for size in self.hidden_layers:
             layer = nn.Linear(prev_dim, size)
-            nn.init.xavier_uniform_(layer.weight, gain=nn.init.calculate_gain("relu"))
+            nn.init.xavier_uniform_(layer.weight)
             nn.init.zeros_(layer.bias)
             layers.append(layer)
             layers.append(nn.ELU())
@@ -466,10 +468,8 @@ class Critic(nn.Module):
 
     def forward(self, x):
         x = self.mlp(x)
-        mean = self.mean_layer(x)  # [B,T,1]
-        # mean = mean.squeeze(-1)    # [B,T]
-        
+        mean = self.mean_layer(x)        
         std = torch.ones_like(mean)  
         
-        return Normal(mean, std)
+        return Independent(Normal(mean, std), 1)
 
