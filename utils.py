@@ -7,6 +7,73 @@ import torch.nn as nn
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def static_scan(fn, inputs, start):
+    """
+    Applies a provided function (fn) iteratively to a sequence of inputs, maintaining an evolving "state" (last)
+    """
+    last = start
+    indices = range(inputs[0].shape[0])
+    flag = True
+
+    for idx in indices:
+        input_list = lambda x: (i[x] for i in inputs)
+        last = fn(last, *input_list(idx))
+
+        if flag:
+            if type(last) == type(dict()):
+                outputs = {k: v.clone().unsqueeze(0) for k, v in last.items()}
+            else:
+                outputs = list()
+                for i in last:
+                    if type(last) == type(dict()):
+                        outputs.append(
+                            {k: v.clone().unsqueeze(0) for k, v in i.items()}
+                        )
+                    else:
+                        outputs.append(i.clone().unsqueeze(0))
+            flag = False
+        else:
+            if type(last) == type(dict()):
+                for key in last.keys():
+                    outputs[key] = torch.cat(
+                        [outputs[key], last[key].unsqueeze(0)], dim=0
+                    )
+            else:
+                for i in range(len(outputs)):
+                    if type(last[i]) == type(dict()):
+                        for key in last[i].keys():
+                            outputs[i][key] = torch.cat(
+                                [outputs[i][key], last[i][key].unsqueeze(0)], dim=0
+                            )
+                    else:
+                        outputs[i] = torch.cat(
+                            [outputs[i], last[i].unsqueeze(0)], dim=0
+                        )
+
+    if type(last) == type(dict()):
+        outputs = [outputs]
+    return outputs
+
+
+def weight_init(m):
+    """
+    Custom weight initialization for PyTorch modules.
+    """
+    if isinstance(m, nn.Linear):
+        nn.init.orthogonal_(m.weight)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.GRUCell):
+        for name, param in m.named_parameters():
+            if "weight" in name:
+                nn.init.orthogonal_(param)
+            elif "bias" in name:
+                nn.init.zeros_(param)
+    elif isinstance(m, nn.LayerNorm):
+        nn.init.ones_(m.weight)
+        nn.init.zeros_(m.bias)
+
+
 def preprocess(image):
     # Preprocess raw images by normalizing pixel values from [0, 255] to [-0.5, 0.5].
     return image / 255.0 - 0.5
