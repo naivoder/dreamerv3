@@ -12,12 +12,10 @@ from torch.distributions import Categorical
 
 
 def preprocess(image):
-    # Normalize pixel values from [0, 255] to [-0.5, 0.5]
     return image / 255.0 - 0.5
 
 
 def quantize(image):
-    # Inverse of preprocess: map [-0.5, 0.5] back to [0, 255] as uint8.
     return ((image + 0.5) * 255).astype(np.uint8)
 
 
@@ -61,41 +59,67 @@ class ReplayBuffer:
     def __init__(self, config, device):
         self.capacity = config.capacity
         self.batch_size = config.batch_size
-        self.seq_length = config.sequence_length
+        self.sequence_length = config.sequence_length
+        self.episodes = []
+        self.current_episode = []
         self.device = device
-        self.episodes = deque(maxlen=self.capacity)
-        self._ep = {"observation": [], "action": [], "reward": [], "done": []}
 
     def store(self, obs, act, rew, next_obs, done):
-        self._ep["observation"].append(obs)
-        self._ep["action"].append(act)
-        self._ep["reward"].append(rew)
-        self._ep["done"].append(done)
+        self.current_episode.append(
+            {
+                "obs": obs,
+                "action": act,
+                "reward": rew,
+                "next_obs": next_obs,
+                "done": done,
+            }
+        )
         if done:
-            # Bootstrap next observation
-            self._ep["observation"].append(next_obs)
-            ep = {k: np.array(v) for k, v in self._ep.items()}
-            # ep["observation"] = quantize(ep["observation"])
-            self.episodes.append(ep)
-            self._ep = {"observation": [], "action": [], "reward": [], "done": []}
+            if len(self.current_episode) >= self.sequence_length:
+                self.episodes.append(self.current_episode)
+            self.current_episode = []
+            if len(self.episodes) > self.capacity:
+                self.episodes.pop(0)
 
     def sample(self, n_batches):
+        valid_episodes = [ep for ep in self.episodes if len(ep) >= self.sequence_length]
+        if len(valid_episodes) == 0:
+            raise StopIteration
         for _ in range(n_batches):
-            batch = {k: [] for k in ["observation", "action", "reward", "done"]}
+            batch_obs, batch_actions, batch_rewards, batch_dones = [], [], [], []
             for _ in range(self.batch_size):
-                ep = np.random.choice(self.episodes)
-                t = np.random.randint(len(ep["observation"]) - self.seq_length)
-                for k in batch.keys():
-                    batch[k].append(ep[k][t : t + self.seq_length])
-            for k in batch.keys():
-                batch[k] = torch.tensor(
-                    np.array(batch[k]), device=self.device, dtype=torch.float32
-                )
-            # batch["observation"] = preprocess(batch["observation"])
+                ep = np.random.choice(valid_episodes)
+                start_idx = np.random.randint(0, len(ep) - self.sequence_length + 1)
+                seq = ep[start_idx : start_idx + self.sequence_length]
+                obs_seq = [transition["obs"] for transition in seq]
+                action_seq = [transition["action"] for transition in seq]
+                reward_seq = [transition["reward"] for transition in seq]
+                done_seq = [transition["done"] for transition in seq]
+                batch_obs.append(np.array(obs_seq))
+                batch_actions.append(np.array(action_seq))
+                batch_rewards.append(np.array(reward_seq))
+                batch_dones.append(np.array(done_seq))
+            batch = {
+                "observation": torch.tensor(
+                    np.array(batch_obs), dtype=torch.float32, device=self.device
+                ),
+                "action": torch.tensor(
+                    np.array(batch_actions), dtype=torch.int64, device=self.device
+                ),
+                "reward": torch.tensor(
+                    np.array(batch_rewards), dtype=torch.float32, device=self.device
+                ),
+                "done": torch.tensor(
+                    np.array(batch_dones), dtype=torch.float32, device=self.device
+                ),
+            }
             yield batch
 
     def __len__(self):
-        return len(self.episodes)
+        try:
+            return len(self.episodes)
+        except:
+            return 0
 
 
 class ObservationEncoder(nn.Module):
@@ -148,9 +172,7 @@ class TransitionDecoder(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(in_dim, 200), nn.ReLU(), nn.Linear(200, out_dim)
         )
-        self.dist_type = (
-            dist_type  # For simplicity, we use regression with symlog loss.
-        )
+        self.dist_type = dist_type
 
     def forward(self, features):
         return self.net(features)
@@ -160,20 +182,17 @@ class RSSM(nn.Module):
     def __init__(self, action_dim, latent_dim, num_classes, deter_dim, embed_dim):
         super().__init__()
         self.action_dim = action_dim
-        self.latent_dim = latent_dim  # number of latent variables
-        self.num_classes = num_classes  # classes per latent
+        self.latent_dim = latent_dim
+        self.num_classes = num_classes
         self.deter_dim = deter_dim
         self.embed_dim = embed_dim
 
-        # GRU takes the flattened one-hot latent concatenated with action.
         self.gru = nn.GRUCell(latent_dim * num_classes + action_dim, deter_dim)
-        # Prior: from [deter, action] -> logits of shape [B, latent_dim * num_classes]
         self.prior_net = nn.Sequential(
             nn.Linear(deter_dim + action_dim, 200),
             nn.ReLU(),
             nn.Linear(200, latent_dim * num_classes),
         )
-        # Posterior: from [deter, embed] -> logits of shape [B, latent_dim * num_classes]
         self.posterior_net = nn.Sequential(
             nn.Linear(deter_dim + embed_dim, 200),
             nn.ReLU(),
@@ -181,9 +200,7 @@ class RSSM(nn.Module):
         )
 
     def init_state(self, batch_size, device):
-        # Initialize deterministic state to zeros.
         deter = torch.zeros(batch_size, self.deter_dim, device=device)
-        # Initialize discrete latent as a one-hot vector (all probability mass in first class)
         stoch = torch.zeros(
             batch_size, self.latent_dim, self.num_classes, device=device
         )
@@ -195,27 +212,24 @@ class RSSM(nn.Module):
         priors, posteriors, features = [], [], []
         stoch, deter = init_state
         for t in range(T):
-            # Update recurrent state using previous latent (flattened) and current action.
             stoch_flat = stoch.view(B, -1)
             x = torch.cat([stoch_flat, action_seq[t]], dim=-1)
             deter = self.gru(x, deter)
-            # Compute prior: predict latent logits from (deter, action).
             prior_input = torch.cat([deter, action_seq[t]], dim=-1)
             prior_logits = self.prior_net(prior_input).view(
                 B, self.latent_dim, self.num_classes
             )
             prior_dist = Categorical(logits=prior_logits)
-            stoch_prior = F.gumbel_softmax(prior_logits, tau=1.0, hard=True)
-            # Compute posterior: condition on (deter, observation embed).
+            # Although we compute a gumbel-softmax sample of the prior, during observation
+            # we use the posterior sample to incorporate the actual observation.
+            _ = F.gumbel_softmax(prior_logits, tau=1.0, hard=True)
             post_input = torch.cat([deter, embed_seq[t]], dim=-1)
             posterior_logits = self.posterior_net(post_input).view(
                 B, self.latent_dim, self.num_classes
             )
             posterior_dist = Categorical(logits=posterior_logits)
             stoch_post = F.gumbel_softmax(posterior_logits, tau=1.0, hard=True)
-            # For training, use the posterior sample (with straight–through gradients).
             stoch = stoch_post
-            # The feature for later prediction is the concatenation of deter and flattened stoch.
             feature = torch.cat([deter, stoch.view(B, -1)], dim=-1)
             features.append(feature)
             priors.append(prior_dist)
@@ -233,7 +247,6 @@ class RSSM(nn.Module):
             action_dist = actor(feature)
             action = action_dist.sample()
             actions.append(action)
-            # Use one-hot for the action.
             action_onehot = F.one_hot(action, num_classes=self.action_dim).float()
             stoch_flat = stoch.view(B, -1)
             x = torch.cat([stoch_flat, action_onehot], dim=-1)
@@ -263,7 +276,6 @@ class WorldModel(nn.Module):
     ):
         super().__init__()
         self.encoder = ObservationEncoder(in_channels, embed_dim)
-        # Discrete latent dynamics.
         self.rssm = RSSM(action_dim, latent_dim, num_classes, deter_dim, embed_dim)
         feature_dim = deter_dim + latent_dim * num_classes
         self.decoder = ObservationDecoder(feature_dim, in_channels, obs_size)
@@ -274,7 +286,6 @@ class WorldModel(nn.Module):
         self.optimizer = optim.Adam(self.parameters(), lr=lr, eps=eps)
 
     def observe(self, observations, actions):
-        # observations: (T, B, C, H, W), actions: (T, B, action_dim)
         T, B = observations.shape[:2]
         obs_flat = observations.view(T * B, *observations.shape[2:])
         embed_flat = self.encoder(obs_flat)
@@ -326,7 +337,7 @@ class Critic(nn.Module):
 
 class DreamerV3:
     def __init__(self, obs_shape, action_dim, config):
-        self.obs_shape = obs_shape  # (C, H, W)
+        self.obs_shape = obs_shape
         self.action_dim = action_dim
         self.config = config
         self.replay_buffer = ReplayBuffer(config, config.device)
@@ -350,14 +361,13 @@ class DreamerV3:
         self.critic_optimizer = optim.Adam(
             self.critic.parameters(), lr=config.critic_lr
         )
-        self.hidden_state = None  # (stoch, deter)
+        self.hidden_state = None
         self.device = device
 
     def init_hidden_state(self):
         self.hidden_state = self.world_model.rssm.init_state(1, self.device)
 
     def act(self, observation):
-        # observation: (C, H, W); add batch dim.
         obs = torch.tensor(
             observation, dtype=torch.float32, device=self.device
         ).unsqueeze(0)
@@ -385,9 +395,7 @@ class DreamerV3:
         self.replay_buffer.store(obs, action, reward, next_obs, done)
 
     def update_world_model(self, batch):
-        # Rearranging batch: (B, T, ...)
         obs = batch["observation"].permute(1, 0, 2, 3, 4)
-        # actions: convert to one-hot
         actions = F.one_hot(batch["action"].long(), num_classes=self.action_dim).float()
         actions = actions.permute(1, 0, 2)
         rewards = batch["reward"].unsqueeze(-1).permute(1, 0, 2)
@@ -420,7 +428,6 @@ class DreamerV3:
         )
         T, B, feat_dim = features.shape
         values = self.critic(features.view(-1, feat_dim)).view(T, B, -1)
-        # Use sigmoid to obtain termination probability and compute effective discount
         discounts = self.config.discount * (1 - torch.sigmoid(terminals))
         returns = []
         future_return = values[-1]
@@ -432,7 +439,14 @@ class DreamerV3:
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
         self.critic_optimizer.step()
-        actor_loss = -(returns - values.detach()).mean()
+
+        # Recompute action log-probs for the imagined actions.
+        features_flat = features.view(-1, feat_dim)
+        actions_flat = actions.view(-1)
+        action_dist = self.actor(features_flat)
+        log_probs = action_dist.log_prob(actions_flat).view(T, B, 1)
+        advantages = returns - values.detach()
+        actor_loss = -(log_probs * advantages).mean()
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
@@ -618,7 +632,7 @@ def create_animation(env_name, agent, seeds=100):
 def train_dreamer(args):
     env_instance = AtariEnv(args.env, shape=(64, 64), repeat=4, clip_rewards=False)
     env = env_instance.make()
-    obs_shape = env.observation_space.shape  # (stack, H, W)
+    obs_shape = env.observation_space.shape
     act_dim = env.action_space.n
     save_prefix = args.env.split("/")[-1]
     print(f"\nEnvironment: {save_prefix}")
@@ -645,7 +659,6 @@ def train_dreamer(args):
             score = 0
             agent.init_hidden_state()
             state, _ = env.reset()
-
             if len(agent.replay_buffer) > config.min_buffer_size:
                 losses = agent.train(num_updates=config.num_updates)
                 if losses:
