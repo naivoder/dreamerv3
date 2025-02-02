@@ -33,9 +33,44 @@ def kl_categorical(p, q):
     return (p_probs * (torch.log(p_probs) - torch.log(q_probs))).sum(dim=[1, 2]).mean()
 
 
+import os
+import cv2
+import gymnasium as gym
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import imageio
+from collections import deque
+from torch.distributions import Categorical
+
+
+def preprocess(image):
+    return image / 255.0 - 0.5
+
+
+def quantize(image):
+    return ((image + 0.5) * 255).astype(np.uint8)
+
+
+def symlog(x):
+    return torch.sign(x) * torch.log(torch.abs(x) + 1)
+
+
+def symexp(x):
+    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
+
+
+def kl_categorical(p, q):
+    p_probs = p.probs.clamp(min=1e-8)
+    q_probs = q.probs.clamp(min=1e-8)
+    return (p_probs * (torch.log(p_probs) - torch.log(q_probs))).sum(dim=[1, 2]).mean()
+
+
 class Config:
     def __init__(self, args):
-        self.capacity = 10000
+        self.capacity = 1000
         self.batch_size = 50
         self.sequence_length = 50
         self.embed_dim = 1024
@@ -50,7 +85,7 @@ class Config:
         self.kl_scale = 1.0
         self.imagination_horizon = 15
         self.num_updates = args.num_updates
-        self.min_buffer_size = 1000
+        self.min_buffer_size = 3
         self.episodes = args.episodes
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -88,7 +123,7 @@ class ReplayBuffer:
         for _ in range(n_batches):
             batch_obs, batch_actions, batch_rewards, batch_dones = [], [], [], []
             for _ in range(self.batch_size):
-                ep = np.random.choice(valid_episodes)
+                ep = valid_episodes[np.random.randint(len(valid_episodes))]
                 start_idx = np.random.randint(0, len(ep) - self.sequence_length + 1)
                 seq = ep[start_idx : start_idx + self.sequence_length]
                 obs_seq = [transition["obs"] for transition in seq]
@@ -116,10 +151,7 @@ class ReplayBuffer:
             yield batch
 
     def __len__(self):
-        try:
-            return len(self.episodes)
-        except:
-            return 0
+        return len(self.episodes)
 
 
 class ObservationEncoder(nn.Module):
@@ -140,7 +172,7 @@ class ObservationEncoder(nn.Module):
 
     def forward(self, x):
         x = self.conv(x)
-        x = x.view(x.size(0), -1)
+        x = x.reshape(x.size(0), -1)
         return self.fc(x)
 
 
@@ -160,7 +192,7 @@ class ObservationDecoder(nn.Module):
 
     def forward(self, x):
         x = self.fc(x)
-        x = x.view(x.size(0), 256, 1, 1)
+        x = x.reshape(x.size(0), 256, 1, 1)
         x = self.deconv(x)
         x = F.interpolate(x, size=self.output_size)
         return x
@@ -212,25 +244,23 @@ class RSSM(nn.Module):
         priors, posteriors, features = [], [], []
         stoch, deter = init_state
         for t in range(T):
-            stoch_flat = stoch.view(B, -1)
+            stoch_flat = stoch.reshape(B, -1)
             x = torch.cat([stoch_flat, action_seq[t]], dim=-1)
             deter = self.gru(x, deter)
             prior_input = torch.cat([deter, action_seq[t]], dim=-1)
-            prior_logits = self.prior_net(prior_input).view(
+            prior_logits = self.prior_net(prior_input).reshape(
                 B, self.latent_dim, self.num_classes
             )
             prior_dist = Categorical(logits=prior_logits)
-            # Although we compute a gumbel-softmax sample of the prior, during observation
-            # we use the posterior sample to incorporate the actual observation.
             _ = F.gumbel_softmax(prior_logits, tau=1.0, hard=True)
             post_input = torch.cat([deter, embed_seq[t]], dim=-1)
-            posterior_logits = self.posterior_net(post_input).view(
+            posterior_logits = self.posterior_net(post_input).reshape(
                 B, self.latent_dim, self.num_classes
             )
             posterior_dist = Categorical(logits=posterior_logits)
             stoch_post = F.gumbel_softmax(posterior_logits, tau=1.0, hard=True)
             stoch = stoch_post
-            feature = torch.cat([deter, stoch.view(B, -1)], dim=-1)
+            feature = torch.cat([deter, stoch.reshape(B, -1)], dim=-1)
             features.append(feature)
             priors.append(prior_dist)
             posteriors.append(posterior_dist)
@@ -242,17 +272,17 @@ class RSSM(nn.Module):
         features, actions = [], []
         B = deter.size(0)
         for _ in range(horizon):
-            feature = torch.cat([deter, stoch.view(B, -1)], dim=-1)
+            feature = torch.cat([deter, stoch.reshape(B, -1)], dim=-1)
             features.append(feature)
             action_dist = actor(feature)
             action = action_dist.sample()
             actions.append(action)
             action_onehot = F.one_hot(action, num_classes=self.action_dim).float()
-            stoch_flat = stoch.view(B, -1)
+            stoch_flat = stoch.reshape(B, -1)
             x = torch.cat([stoch_flat, action_onehot], dim=-1)
             deter = self.gru(x, deter)
             prior_input = torch.cat([deter, action_onehot], dim=-1)
-            prior_logits = self.prior_net(prior_input).view(
+            prior_logits = self.prior_net(prior_input).reshape(
                 B, self.latent_dim, self.num_classes
             )
             stoch = F.gumbel_softmax(prior_logits, tau=1.0, hard=True)
@@ -287,15 +317,15 @@ class WorldModel(nn.Module):
 
     def observe(self, observations, actions):
         T, B = observations.shape[:2]
-        obs_flat = observations.view(T * B, *observations.shape[2:])
+        obs_flat = observations.reshape(T * B, *observations.shape[2:])
         embed_flat = self.encoder(obs_flat)
-        embed = embed_flat.view(T, B, -1)
+        embed = embed_flat.reshape(T, B, -1)
         init_state = self.rssm.init_state(B, observations.device)
         (priors, posteriors), features = self.rssm.observe(embed, actions, init_state)
         feat_dim = features.shape[-1]
-        features_flat = features.view(T * B, feat_dim)
+        features_flat = features.reshape(T * B, feat_dim)
         recon_flat = self.decoder(features_flat)
-        recon = recon_flat.view(T, B, *observations.shape[2:])
+        recon = recon_flat.reshape(T, B, *observations.shape[2:])
         reward_pred = self.reward_decoder(features_flat)
         continue_pred = self.continue_decoder(features_flat)
         return (priors, posteriors), features, recon, reward_pred, continue_pred
@@ -303,7 +333,7 @@ class WorldModel(nn.Module):
     def imagine(self, init_state, actor, horizon):
         features, actions = self.rssm.imagine(init_state, actor, horizon)
         T, B, feat_dim = features.shape
-        features_flat = features.view(T * B, feat_dim)
+        features_flat = features.reshape(T * B, feat_dim)
         reward_pred = self.reward_decoder(features_flat)
         continue_pred = self.continue_decoder(features_flat)
         return features, actions, reward_pred, continue_pred
@@ -375,16 +405,16 @@ class DreamerV3:
             if self.hidden_state is None:
                 self.init_hidden_state()
             stoch, deter = self.hidden_state
-            feature = torch.cat([deter, stoch.view(1, -1)], dim=-1)
+            feature = torch.cat([deter, stoch.reshape(1, -1)], dim=-1)
             action_dist = self.actor(feature)
             action = action_dist.sample()
             action_onehot = F.one_hot(action, num_classes=self.action_dim).float()
-            stoch_flat = stoch.view(1, -1)
+            stoch_flat = stoch.reshape(1, -1)
             x = torch.cat([stoch_flat, action_onehot], dim=-1)
             deter = self.world_model.rssm.gru(x, deter)
             prior_input = torch.cat([deter, action_onehot], dim=-1)
             prior_logits = self.world_model.rssm.prior_net(prior_input)
-            prior_logits = prior_logits.view(
+            prior_logits = prior_logits.reshape(
                 1, self.world_model.rssm.latent_dim, self.world_model.rssm.num_classes
             )
             stoch = F.gumbel_softmax(prior_logits, tau=1.0, hard=True)
@@ -403,9 +433,11 @@ class DreamerV3:
             self.world_model.observe(obs, actions)
         )
         recon_loss = F.mse_loss(recon, obs)
-        reward_loss = F.mse_loss(reward_pred, rewards)
+        reward_loss = F.mse_loss(reward_pred, rewards.reshape(-1, 1))
         dones = batch["done"].unsqueeze(-1).permute(1, 0, 2)
-        terminal_loss = F.binary_cross_entropy_with_logits(terminal_pred, dones)
+        terminal_loss = F.binary_cross_entropy_with_logits(
+            terminal_pred, dones.reshape(-1, 1)
+        )
         kl_loss = 0
         T = len(priors)
         for t in range(T):
@@ -423,11 +455,18 @@ class DreamerV3:
 
     def update_actor_and_critic(self, init_state):
         horizon = self.config.imagination_horizon
+        # Generate imagined trajectories from the current state using the fixed world model.
         features, actions, rewards, terminals = self.world_model.imagine(
             init_state, self.actor, horizon
         )
+        # Detach the imagined rollouts to prevent gradients flowing into the world model.
+        features = features.detach()
+        rewards = rewards.detach()
+        terminals = terminals.detach()
         T, B, feat_dim = features.shape
-        values = self.critic(features.view(-1, feat_dim)).view(T, B, -1)
+
+        # Critic update.
+        values = self.critic(features.reshape(-1, feat_dim)).reshape(T, B, -1)
         discounts = self.config.discount * (1 - torch.sigmoid(terminals))
         returns = []
         future_return = values[-1]
@@ -440,16 +479,17 @@ class DreamerV3:
         critic_loss.backward()
         self.critic_optimizer.step()
 
-        # Recompute action log-probs for the imagined actions.
-        features_flat = features.view(-1, feat_dim)
-        actions_flat = actions.view(-1)
-        action_dist = self.actor(features_flat)
-        log_probs = action_dist.log_prob(actions_flat).view(T, B, 1)
-        advantages = returns - values.detach()
+        # Actor update.
+        features_flat_actor = features.reshape(-1, feat_dim)
+        actions_flat = actions.reshape(-1)
+        action_dist = self.actor(features_flat_actor)
+        log_probs = action_dist.log_prob(actions_flat).reshape(T, B, 1)
+        advantages = returns.detach() - values.detach()
         actor_loss = -(log_probs * advantages).mean()
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
+
         return {"actor_loss": actor_loss.item(), "critic_loss": critic_loss.item()}
 
     def train(self, num_updates=1):
@@ -695,7 +735,7 @@ if __name__ == "__main__":
         "--env", type=str, default=None, help="Environment ID (e.g. ALE/Breakout-v5)"
     )
     parser.add_argument("--episodes", type=int, default=10000)
-    parser.add_argument("--num_updates", type=int, default=10)
+    parser.add_argument("--num_updates", type=int, default=1)
     args = parser.parse_args()
 
     for folder in ["metrics", "environments", "weights", "results"]:
