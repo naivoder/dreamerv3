@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import imageio
 from collections import deque
-from torch.distributions import Normal, Categorical, Bernoulli
+from torch.distributions import Categorical
 
 
 def preprocess(image):
@@ -21,13 +21,28 @@ def quantize(image):
     return ((image + 0.5) * 255).astype(np.uint8)
 
 
+def symlog(x):
+    return torch.sign(x) * torch.log(torch.abs(x) + 1)
+
+
+def symexp(x):
+    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
+
+
+def kl_categorical(p, q):
+    p_probs = p.probs.clamp(min=1e-8)
+    q_probs = q.probs.clamp(min=1e-8)
+    return (p_probs * (torch.log(p_probs) - torch.log(q_probs))).sum(dim=[1, 2]).mean()
+
+
 class Config:
     def __init__(self, args):
-        self.capacity = 1000
-        self.batch_size = 32
+        self.capacity = 10000
+        self.batch_size = 50
         self.sequence_length = 50
         self.embed_dim = 1024
-        self.latent_dim = 30
+        self.latent_dim = 32
+        self.num_classes = 32
         self.deter_dim = 200
         self.lr = 6e-4
         self.eps = 1e-7
@@ -36,10 +51,8 @@ class Config:
         self.discount = 0.99
         self.kl_scale = 1.0
         self.imagination_horizon = 15
-        self.train_horizon = args.train_horizon
         self.num_updates = args.num_updates
         self.min_buffer_size = 1000
-        self.n_envs = 1
         self.episodes = args.episodes
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -62,7 +75,7 @@ class ReplayBuffer:
             # Bootstrap next observation
             self._ep["observation"].append(next_obs)
             ep = {k: np.array(v) for k, v in self._ep.items()}
-            ep["observation"] = quantize(ep["observation"])
+            # ep["observation"] = quantize(ep["observation"])
             self.episodes.append(ep)
             self._ep = {"observation": [], "action": [], "reward": [], "done": []}
 
@@ -78,7 +91,7 @@ class ReplayBuffer:
                 batch[k] = torch.tensor(
                     np.array(batch[k]), device=self.device, dtype=torch.float32
                 )
-            batch["observation"] = preprocess(batch["observation"])
+            # batch["observation"] = preprocess(batch["observation"])
             yield batch
 
     def __len__(self):
@@ -102,7 +115,6 @@ class ObservationEncoder(nn.Module):
         self.fc = nn.Linear(256, embed_dim)
 
     def forward(self, x):
-        # x: (B, C, H, W)
         x = self.conv(x)
         x = x.view(x.size(0), -1)
         return self.fc(x)
@@ -123,119 +135,114 @@ class ObservationDecoder(nn.Module):
         self.output_size = output_size
 
     def forward(self, x):
-        # x: (B, feature_dim)
         x = self.fc(x)
         x = x.view(x.size(0), 256, 1, 1)
         x = self.deconv(x)
-        x = nn.functional.interpolate(x, size=self.output_size)
+        x = F.interpolate(x, size=self.output_size)
         return x
 
 
 class TransitionDecoder(nn.Module):
-    def __init__(self, in_dim, out_dim, dist_type="normal"):
+    def __init__(self, in_dim, out_dim, dist_type="regression"):
         super().__init__()
-        self.dist_type = dist_type
         self.net = nn.Sequential(
             nn.Linear(in_dim, 200), nn.ReLU(), nn.Linear(200, out_dim)
         )
-        if dist_type == "normal":
-            self.std = nn.Parameter(torch.zeros(out_dim))
+        self.dist_type = (
+            dist_type  # For simplicity, we use regression with symlog loss.
+        )
 
     def forward(self, features):
-        x = self.net(features)
-        if self.dist_type == "normal":
-            std = torch.exp(self.std)
-            return Normal(x, std)
-        elif self.dist_type == "bernoulli":
-            return Bernoulli(logits=x)
-
-
-class Prior(nn.Module):
-    def __init__(self, action_dim, latent_dim, deter_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(deter_dim + action_dim, 200),
-            nn.ReLU(),
-            nn.Linear(200, 2 * latent_dim),
-        )
-        self.latent_dim = latent_dim
-
-    def forward(self, deter, action):
-        x = torch.cat([deter, action], dim=-1)
-        stats = self.net(x)
-        mean, log_std = torch.chunk(stats, 2, dim=-1)
-        std = torch.exp(log_std.clamp(-4, 15))
-        return Normal(mean, std)
-
-
-class Posterior(nn.Module):
-    def __init__(self, deter_dim, embed_dim, latent_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(deter_dim + embed_dim, 200),
-            nn.ReLU(),
-            nn.Linear(200, 2 * latent_dim),
-        )
-        self.latent_dim = latent_dim
-
-    def forward(self, deter, embed):
-        x = torch.cat([deter, embed], dim=-1)
-        stats = self.net(x)
-        mean, log_std = torch.chunk(stats, 2, dim=-1)
-        std = torch.exp(log_std.clamp(-4, 15))
-        return Normal(mean, std)
+        return self.net(features)
 
 
 class RSSM(nn.Module):
-    def __init__(self, action_dim, latent_dim, deter_dim, embed_dim):
+    def __init__(self, action_dim, latent_dim, num_classes, deter_dim, embed_dim):
         super().__init__()
-        self.latent_dim = latent_dim
+        self.action_dim = action_dim
+        self.latent_dim = latent_dim  # number of latent variables
+        self.num_classes = num_classes  # classes per latent
         self.deter_dim = deter_dim
         self.embed_dim = embed_dim
-        self.gru = nn.GRUCell(latent_dim + action_dim, deter_dim)
-        self.prior = Prior(action_dim, latent_dim, deter_dim)
-        self.posterior = Posterior(deter_dim, embed_dim, latent_dim)
+
+        # GRU takes the flattened one-hot latent concatenated with action.
+        self.gru = nn.GRUCell(latent_dim * num_classes + action_dim, deter_dim)
+        # Prior: from [deter, action] -> logits of shape [B, latent_dim * num_classes]
+        self.prior_net = nn.Sequential(
+            nn.Linear(deter_dim + action_dim, 200),
+            nn.ReLU(),
+            nn.Linear(200, latent_dim * num_classes),
+        )
+        # Posterior: from [deter, embed] -> logits of shape [B, latent_dim * num_classes]
+        self.posterior_net = nn.Sequential(
+            nn.Linear(deter_dim + embed_dim, 200),
+            nn.ReLU(),
+            nn.Linear(200, latent_dim * num_classes),
+        )
 
     def init_state(self, batch_size, device):
+        # Initialize deterministic state to zeros.
         deter = torch.zeros(batch_size, self.deter_dim, device=device)
-        stoch = torch.zeros(batch_size, self.latent_dim, device=device)
+        # Initialize discrete latent as a one-hot vector (all probability mass in first class)
+        stoch = torch.zeros(
+            batch_size, self.latent_dim, self.num_classes, device=device
+        )
+        stoch[:, :, 0] = 1.0
         return (stoch, deter)
 
     def observe(self, embed_seq, action_seq, init_state):
-        # embed_seq: (T, B, embed_dim); action_seq: (T, B, action_dim)
         T, B = action_seq.shape[:2]
         priors, posteriors, features = [], [], []
         stoch, deter = init_state
         for t in range(T):
-            x = torch.cat([stoch, action_seq[t]], dim=-1)
+            # Update recurrent state using previous latent (flattened) and current action.
+            stoch_flat = stoch.view(B, -1)
+            x = torch.cat([stoch_flat, action_seq[t]], dim=-1)
             deter = self.gru(x, deter)
-            prior_dist = self.prior(deter, action_seq[t])
-            stoch_prior = prior_dist.rsample()
-            post_dist = self.posterior(deter, embed_seq[t])
-            stoch = post_dist.rsample()
-            features.append(torch.cat([deter, stoch], dim=-1))
+            # Compute prior: predict latent logits from (deter, action).
+            prior_input = torch.cat([deter, action_seq[t]], dim=-1)
+            prior_logits = self.prior_net(prior_input).view(
+                B, self.latent_dim, self.num_classes
+            )
+            prior_dist = Categorical(logits=prior_logits)
+            stoch_prior = F.gumbel_softmax(prior_logits, tau=1.0, hard=True)
+            # Compute posterior: condition on (deter, observation embed).
+            post_input = torch.cat([deter, embed_seq[t]], dim=-1)
+            posterior_logits = self.posterior_net(post_input).view(
+                B, self.latent_dim, self.num_classes
+            )
+            posterior_dist = Categorical(logits=posterior_logits)
+            stoch_post = F.gumbel_softmax(posterior_logits, tau=1.0, hard=True)
+            # For training, use the posterior sample (with straight–through gradients).
+            stoch = stoch_post
+            # The feature for later prediction is the concatenation of deter and flattened stoch.
+            feature = torch.cat([deter, stoch.view(B, -1)], dim=-1)
+            features.append(feature)
             priors.append(prior_dist)
-            posteriors.append(post_dist)
+            posteriors.append(posterior_dist)
         features = torch.stack(features, dim=0)
         return (priors, posteriors), features
 
     def imagine(self, init_state, actor, horizon):
-        # Generate imagined latent rollouts given an actor
         stoch, deter = init_state
         features, actions = [], []
+        B = deter.size(0)
         for _ in range(horizon):
-            feature = torch.cat([deter, stoch], dim=-1)
+            feature = torch.cat([deter, stoch.view(B, -1)], dim=-1)
             features.append(feature)
             action_dist = actor(feature)
             action = action_dist.sample()
             actions.append(action)
-            action_onehot = F.one_hot(
-                action, num_classes=actor.net[-1].out_features
-            ).float()
-            x = torch.cat([stoch, action_onehot], dim=-1)
+            # Use one-hot for the action.
+            action_onehot = F.one_hot(action, num_classes=self.action_dim).float()
+            stoch_flat = stoch.view(B, -1)
+            x = torch.cat([stoch_flat, action_onehot], dim=-1)
             deter = self.gru(x, deter)
-            prior_dist = self.prior(deter, action_onehot)
-            stoch = prior_dist.rsample()
+            prior_input = torch.cat([deter, action_onehot], dim=-1)
+            prior_logits = self.prior_net(prior_input).view(
+                B, self.latent_dim, self.num_classes
+            )
+            stoch = F.gumbel_softmax(prior_logits, tau=1.0, hard=True)
         features = torch.stack(features, dim=0)
         actions = torch.stack(actions, dim=0)
         return features, actions
@@ -248,20 +255,22 @@ class WorldModel(nn.Module):
         action_dim,
         embed_dim,
         latent_dim,
+        num_classes,
         deter_dim,
         obs_size,
-        lr=6e-4,
-        eps=1e-7,
+        lr=1e-4,
+        eps=1e-8,
     ):
         super().__init__()
         self.encoder = ObservationEncoder(in_channels, embed_dim)
-        # Decoder reconstructs observation from latent features (deter + stoch)
-        self.decoder = ObservationDecoder(deter_dim + latent_dim, in_channels, obs_size)
-        self.reward_decoder = TransitionDecoder(deter_dim + latent_dim, 1, "normal")
-        self.terminal_decoder = TransitionDecoder(
-            deter_dim + latent_dim, 1, "bernoulli"
+        # Discrete latent dynamics.
+        self.rssm = RSSM(action_dim, latent_dim, num_classes, deter_dim, embed_dim)
+        feature_dim = deter_dim + latent_dim * num_classes
+        self.decoder = ObservationDecoder(feature_dim, in_channels, obs_size)
+        self.reward_decoder = TransitionDecoder(feature_dim, 1, dist_type="regression")
+        self.continue_decoder = TransitionDecoder(
+            feature_dim, 1, dist_type="regression"
         )
-        self.rssm = RSSM(action_dim, latent_dim, deter_dim, embed_dim)
         self.optimizer = optim.Adam(self.parameters(), lr=lr, eps=eps)
 
     def observe(self, observations, actions):
@@ -276,21 +285,17 @@ class WorldModel(nn.Module):
         features_flat = features.view(T * B, feat_dim)
         recon_flat = self.decoder(features_flat)
         recon = recon_flat.view(T, B, *observations.shape[2:])
-        reward_dist = self.reward_decoder(features_flat)
-        reward = reward_dist.mean.view(T, B, -1)
-        terminal_dist = self.terminal_decoder(features_flat)
-        terminal = terminal_dist.logits.view(T, B, -1)
-        return (priors, posteriors), features, recon, reward, terminal
+        reward_pred = self.reward_decoder(features_flat)
+        continue_pred = self.continue_decoder(features_flat)
+        return (priors, posteriors), features, recon, reward_pred, continue_pred
 
     def imagine(self, init_state, actor, horizon):
         features, actions = self.rssm.imagine(init_state, actor, horizon)
         T, B, feat_dim = features.shape
         features_flat = features.view(T * B, feat_dim)
-        reward_dist = self.reward_decoder(features_flat)
-        reward = reward_dist.mean.view(T, B, -1)
-        terminal_dist = self.terminal_decoder(features_flat)
-        terminal = terminal_dist.logits.view(T, B, -1)
-        return features, actions, reward, terminal
+        reward_pred = self.reward_decoder(features_flat)
+        continue_pred = self.continue_decoder(features_flat)
+        return features, actions, reward_pred, continue_pred
 
     def decode(self, features):
         return self.decoder(features)
@@ -305,7 +310,7 @@ class Actor(nn.Module):
 
     def forward(self, x):
         logits = self.net(x)
-        return Categorical(logits=logits)
+        return torch.distributions.Categorical(logits=logits)
 
 
 class Critic(nn.Module):
@@ -324,50 +329,55 @@ class DreamerV3:
         self.obs_shape = obs_shape  # (C, H, W)
         self.action_dim = action_dim
         self.config = config
-        self.device = config.device
+        self.replay_buffer = ReplayBuffer(config, config.device)
+        device = config.device
         in_channels = obs_shape[0]
         self.world_model = WorldModel(
             in_channels,
             action_dim,
             embed_dim=config.embed_dim,
             latent_dim=config.latent_dim,
+            num_classes=config.num_classes,
             deter_dim=config.deter_dim,
             obs_size=obs_shape[1:],
             lr=config.lr,
             eps=config.eps,
-        ).to(self.device)
-        feat_dim = config.deter_dim + config.latent_dim
-        self.actor = Actor(feat_dim, action_dim).to(self.device)
-        self.critic = Critic(feat_dim).to(self.device)
+        ).to(device)
+        feature_dim = config.deter_dim + config.latent_dim * config.num_classes
+        self.actor = Actor(feature_dim, action_dim).to(device)
+        self.critic = Critic(feature_dim).to(device)
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=config.actor_lr)
         self.critic_optimizer = optim.Adam(
             self.critic.parameters(), lr=config.critic_lr
         )
-        self.replay_buffer = ReplayBuffer(config, self.device)
         self.hidden_state = None  # (stoch, deter)
+        self.device = device
 
     def init_hidden_state(self):
         self.hidden_state = self.world_model.rssm.init_state(1, self.device)
 
     def act(self, observation):
-        # observation: (C, H, W); add batch dim
+        # observation: (C, H, W); add batch dim.
         obs = torch.tensor(
             observation, dtype=torch.float32, device=self.device
         ).unsqueeze(0)
         with torch.no_grad():
-            _ = self.world_model.encoder(obs)
             if self.hidden_state is None:
                 self.init_hidden_state()
             stoch, deter = self.hidden_state
-            feature = torch.cat([deter, stoch], dim=-1)
+            feature = torch.cat([deter, stoch.view(1, -1)], dim=-1)
             action_dist = self.actor(feature)
             action = action_dist.sample()
-            # Convert discrete action into one-hot for dynamics
             action_onehot = F.one_hot(action, num_classes=self.action_dim).float()
-            x = torch.cat([stoch, action_onehot], dim=-1)
+            stoch_flat = stoch.view(1, -1)
+            x = torch.cat([stoch_flat, action_onehot], dim=-1)
             deter = self.world_model.rssm.gru(x, deter)
-            prior_dist = self.world_model.rssm.prior(deter, action_onehot)
-            stoch = prior_dist.rsample()
+            prior_input = torch.cat([deter, action_onehot], dim=-1)
+            prior_logits = self.world_model.rssm.prior_net(prior_input)
+            prior_logits = prior_logits.view(
+                1, self.world_model.rssm.latent_dim, self.world_model.rssm.num_classes
+            )
+            stoch = F.gumbel_softmax(prior_logits, tau=1.0, hard=True)
             self.hidden_state = (stoch, deter)
         return int(action.item())
 
@@ -585,9 +595,9 @@ def save_animation(frames, filename):
 
 
 def create_animation(env_name, agent, seeds=100):
-    agent.load_checkpoint(env_name)
     env = AtariEnv(env_name, shape=(42, 42), repeat=4, clip_rewards=False).make()
     save_prefix = env_name.split("/")[-1]
+    agent.load_checkpoint(save_prefix)
     best_total_reward, best_frames = float("-inf"), None
     for s in range(seeds):
         state, _ = env.reset()
@@ -617,7 +627,7 @@ def train_dreamer(args):
     config = Config(args)
     agent = DreamerV3(obs_shape, act_dim, config)
     world_losses, actor_losses, critic_losses = [], [], []
-    best_avg_reward, frame_idx = float("-inf"), 0
+    best_avg_reward = float("-inf")
     avg_reward_window = 100
     history = []
     score = 0
@@ -635,19 +645,16 @@ def train_dreamer(args):
             score = 0
             agent.init_hidden_state()
             state, _ = env.reset()
+
+            if len(agent.replay_buffer) > config.min_buffer_size:
+                losses = agent.train(num_updates=config.num_updates)
+                if losses:
+                    world_losses.append(losses["world_loss"])
+                    actor_losses.append(losses["actor_loss"])
+                    critic_losses.append(losses["critic_loss"])
         else:
             state = next_state
 
-        if (
-            len(agent.replay_buffer) > config.min_buffer_size
-            and frame_idx % config.train_horizon == 0
-        ):
-            losses = agent.train(num_updates=config.num_updates)
-            if losses:
-                world_losses.append(losses["world_loss"])
-                actor_losses.append(losses["actor_loss"])
-                critic_losses.append(losses["critic_loss"])
-        frame_idx += 1
         if history:
             avg_score = np.mean(history[-avg_reward_window:])
             print(
@@ -674,9 +681,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--env", type=str, default=None, help="Environment ID (e.g. ALE/Breakout-v5)"
     )
-    parser.add_argument("--episodes", type=int, default=1000)
-    parser.add_argument("--num_updates", type=int, default=1)
-    parser.add_argument("--train_horizon", type=int, default=50)
+    parser.add_argument("--episodes", type=int, default=10000)
+    parser.add_argument("--num_updates", type=int, default=10)
     args = parser.parse_args()
 
     for folder in ["metrics", "environments", "weights", "results"]:
