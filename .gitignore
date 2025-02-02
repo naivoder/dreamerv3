@@ -2,8 +2,9 @@
 *.pt
 weights/
 tovi/
-# environments/
-# metrics/
+environments/
+metrics/
+results/
 csv/
 *.csv
 # Byte-compiled / optimized / DLL files
