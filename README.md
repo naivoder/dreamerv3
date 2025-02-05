@@ -2,11 +2,11 @@
 
 🚫🚧👷‍♀️ Warning: Under Construction 👷‍♂️🚧🚫
 
-This repository contains a PyTorch implementation of the DreamerV3 algorithm, aimed at providing a more readable and understandable version compared to the official implementations. It serves as an opportunity to learn and explore the intricacies of the DreamerV3 algorithm while maintaining clarity and simplicity.
+This repository contains a PyTorch implementation of the DreamerV3 algorithm, aimed at providing a more readable and accessible version compared to the official implementations. 
 
 ## Overview
 
-DreamerV3 is a state-of-the-art model-based reinforcement learning algorithm that learns a world model from experiences and uses it to train an actor-critic policy from imagined trajectories. The algorithm consists of several key components:
+DreamerV3 is a model-based reinforcement learning algorithm that learns a world model of the environment dynamics, and uses it to train an actor-critic policy from imagined trajectories. The algorithm consists of several key components:
 
 1. A world model that encodes sensory inputs into latent representations and predicts future states and rewards.
 2. An actor network that learns to take actions in the imagined environment.
@@ -34,44 +34,26 @@ To set up the environment and install the required dependencies, follow these st
 
 ## Running the Code
 
-To run the DreamerV3 algorithm on the atari environments, use the following command:
-
 ```bash
-python run_atari.py
+python dreamerv3.py
 ```
-
-I've also been messing around with the Park OS environments, which you can run with:
-
-```bash
-python run_park.py
-```
-
-Although, tbh, I've been incredibly lazy about making sure it works for both, so at any given time you should fully expect that I've broken one or the other... I promise I'll fix it up one day (🤞)
 
 ### Command-line Arguments
 
-The script supports various command-line arguments to customize the training process. Some key options include:
-
 - `--env`: Specify the environment
 - `--episodes`: Number of episodes to train (default: 10000)
-- `--latent_dim`: Dimension of latent space (default: 32)
-- `--hidden_dim`: Hidden dimension size (default: 512)
-- `--actor_lr`: Learning rate for the actor (default: 3e-5)
-- `--critic_lr`: Learning rate for the critic (default: 3e-5)
-- `--world_lr`: Learning rate for the world model (default: 1e-4)
-- `--batch_size`: Batch size for training (default: 250)
-- `--seq_len`: Sequence length for training (default: 50)
+
 
 Example:
 
 ```bash
-python dreamer.py --env CartPole-v1 --episodes 5000 --batch_size 128
+python dreamerv3.py --env CartPole-v1 --episodes 5000 
 ```
 
 For a full list of available options, run:  
 
 ```bash
-python dreamer.py --help
+python dreamerv3.py --help
 ```
 
 ## Acknowledgements
