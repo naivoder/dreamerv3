@@ -10,48 +10,12 @@ import imageio
 from collections import deque
 from torch.distributions import Categorical
 
-
 def preprocess(image):
-    return image / 255.0 - 0.5
+    return (image / 255.0).astype(np.float32)
 
 
 def quantize(image):
-    return ((image + 0.5) * 255).astype(np.uint8)
-
-
-def symlog(x):
-    return torch.sign(x) * torch.log(torch.abs(x) + 1)
-
-
-def symexp(x):
-    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
-
-
-def kl_categorical(p, q):
-    p_probs = p.probs.clamp(min=1e-8)
-    q_probs = q.probs.clamp(min=1e-8)
-    return (p_probs * (torch.log(p_probs) - torch.log(q_probs))).sum(dim=[1, 2]).mean()
-
-
-import os
-import cv2
-import gymnasium as gym
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-import imageio
-from collections import deque
-from torch.distributions import Categorical
-
-
-def preprocess(image):
-    return image / 255.0 - 0.5
-
-
-def quantize(image):
-    return ((image + 0.5) * 255).astype(np.uint8)
+    return (image * 255).astype(np.uint8)
 
 
 def symlog(x):
@@ -70,7 +34,7 @@ def kl_categorical(p, q):
 
 class Config:
     def __init__(self, args):
-        self.capacity = 1000
+        self.capacity = 100
         self.batch_size = 50
         self.sequence_length = 50
         self.embed_dim = 1024
@@ -79,13 +43,13 @@ class Config:
         self.deter_dim = 200
         self.lr = 6e-4
         self.eps = 1e-7
-        self.actor_lr = 1e-4
-        self.critic_lr = 1e-4
+        self.actor_lr = 3e-4
+        self.critic_lr = 3e-4
         self.discount = 0.99
         self.kl_scale = 1.0
         self.imagination_horizon = 15
         self.num_updates = args.num_updates
-        self.min_buffer_size = 3
+        self.min_buffer_size = 10
         self.episodes = args.episodes
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -102,7 +66,7 @@ class ReplayBuffer:
     def store(self, obs, act, rew, next_obs, done):
         self.current_episode.append(
             {
-                "obs": obs,
+                "obs": quantize(obs),
                 "action": act,
                 "reward": rew,
                 "next_obs": next_obs,
@@ -120,13 +84,14 @@ class ReplayBuffer:
         valid_episodes = [ep for ep in self.episodes if len(ep) >= self.sequence_length]
         if len(valid_episodes) == 0:
             raise StopIteration
+        
         for _ in range(n_batches):
             batch_obs, batch_actions, batch_rewards, batch_dones = [], [], [], []
             for _ in range(self.batch_size):
                 ep = valid_episodes[np.random.randint(len(valid_episodes))]
                 start_idx = np.random.randint(0, len(ep) - self.sequence_length + 1)
                 seq = ep[start_idx : start_idx + self.sequence_length]
-                obs_seq = [transition["obs"] for transition in seq]
+                obs_seq = [preprocess(transition["obs"]) for transition in seq]
                 action_seq = [transition["action"] for transition in seq]
                 reward_seq = [transition["reward"] for transition in seq]
                 done_seq = [transition["done"] for transition in seq]
@@ -565,7 +530,7 @@ class RepeatActionAndMaxFrame(gym.Wrapper):
 
 
 class PreprocessFrame(gym.ObservationWrapper):
-    def __init__(self, env, shape=(84, 84)):
+    def __init__(self, env, shape=(64, 64)):
         super().__init__(env)
         self.shape = shape
         self.observation_space = gym.spaces.Box(0.0, 1.0, self.shape, dtype=np.float32)
@@ -573,7 +538,7 @@ class PreprocessFrame(gym.ObservationWrapper):
     def observation(self, state):
         state = cv2.cvtColor(state, cv2.COLOR_RGB2GRAY)
         state = cv2.resize(state, self.shape, interpolation=cv2.INTER_AREA)
-        return state / 255.0
+        return preprocess(state)
 
 
 class StackFrames(gym.ObservationWrapper):
@@ -649,7 +614,7 @@ def save_animation(frames, filename):
 
 
 def create_animation(env_name, agent, seeds=100):
-    env = AtariEnv(env_name, shape=(42, 42), repeat=4, clip_rewards=False).make()
+    env = AtariEnv(env_name, shape=(64, 64), repeat=4, clip_rewards=False).make()
     save_prefix = env_name.split("/")[-1]
     agent.load_checkpoint(save_prefix)
     best_total_reward, best_frames = float("-inf"), None
@@ -668,19 +633,28 @@ def create_animation(env_name, agent, seeds=100):
             best_frames = frames
     save_animation(best_frames, f"environments/{save_prefix}.gif")
 
+def save_final_weights(agent, save_prefix):
+    torch.save(
+        agent.world_model.state_dict(), f"weights/{save_prefix}_world_model_final.pth"
+    )
+    torch.save(agent.actor.state_dict(), f"weights/{save_prefix}_actor_final.pth")
+    torch.save(agent.critic.state_dict(), f"weights/{save_prefix}_critic_final.pth")
 
 def train_dreamer(args):
-    env_instance = AtariEnv(args.env, shape=(64, 64), repeat=4, clip_rewards=False)
-    env = env_instance.make()
+    env = AtariEnv(args.env).make()
+    
     obs_shape = env.observation_space.shape
     act_dim = env.action_space.n
     save_prefix = args.env.split("/")[-1]
+    
     print(f"\nEnvironment: {save_prefix}")
     print(f"Obs.Space: {obs_shape}")
     print(f"Act.Space: {act_dim}")
+   
     config = Config(args)
     agent = DreamerV3(obs_shape, act_dim, config)
     world_losses, actor_losses, critic_losses = [], [], []
+    
     best_avg_reward = float("-inf")
     avg_reward_window = 100
     history = []
@@ -694,17 +668,20 @@ def train_dreamer(args):
         done = term or trunc
         agent.store_transition(state, action, reward, next_state, done)
         score += reward
+        
         if done:
             history.append(score)
             score = 0
             agent.init_hidden_state()
             state, _ = env.reset()
+            
             if len(agent.replay_buffer) > config.min_buffer_size:
                 losses = agent.train(num_updates=config.num_updates)
                 if losses:
                     world_losses.append(losses["world_loss"])
                     actor_losses.append(losses["actor_loss"])
                     critic_losses.append(losses["critic_loss"])
+        
         else:
             state = next_state
 
@@ -714,15 +691,14 @@ def train_dreamer(args):
                 f"[Episode {len(history):05d}/{config.episodes}]  Avg.Score = {avg_score:.2f}",
                 end="\r",
             )
+            
             if avg_score > best_avg_reward:
                 best_avg_reward = avg_score
                 agent.save_checkpoint(save_prefix)
+    
+    print(f"[Episode {len(history):05d}/{config.episodes}]  Avg.Score = {avg_score:.2f}")
 
-    torch.save(
-        agent.world_model.state_dict(), f"weights/{save_prefix}_world_model_final.pth"
-    )
-    torch.save(agent.actor.state_dict(), f"weights/{save_prefix}_actor_final.pth")
-    torch.save(agent.critic.state_dict(), f"weights/{save_prefix}_critic_final.pth")
+    
     plot_results(history, world_losses, actor_losses, critic_losses, save_prefix)
     create_animation(args.env, agent)
 
@@ -731,10 +707,8 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--env", type=str, default=None, help="Environment ID (e.g. ALE/Breakout-v5)"
-    )
-    parser.add_argument("--episodes", type=int, default=10000)
+    parser.add_argument("--env", type=str, default=None)
+    parser.add_argument("--episodes", type=int, default=100000)
     parser.add_argument("--num_updates", type=int, default=1)
     args = parser.parse_args()
 
@@ -751,6 +725,6 @@ if __name__ == "__main__":
     if args.env:
         train_dreamer(args)
     else:
-        for env_name in default_envs:
+        for env_name in default_envs[::-1]:
             args.env = env_name
             train_dreamer(args)
