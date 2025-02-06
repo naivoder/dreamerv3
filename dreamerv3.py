@@ -23,9 +23,6 @@ def quantize(image):
 def symlog(x):
     return torch.sign(x) * torch.log(torch.abs(x) + 1)
 
-def symexp(x):
-    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1)
-
 def init_weights(m):
     if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
         nn.init.xavier_normal_(m.weight)
@@ -420,27 +417,6 @@ class DreamerV3:
         self.actor.load_state_dict(torch.load(f"weights/{env_name}_actor.pt"))
         self.critic.load_state_dict(torch.load(f"weights/{env_name}_critic.pt"))
 
-def log_and_plot(writer, loss_log, save_prefix):
-    import matplotlib.pyplot as plt
-
-    for key, filename in [("reward", "reward"),
-                          ("recon_loss", "recon_loss"),
-                          ("reward_loss", "reward_loss"),
-                          ("terminal_loss", "terminal_loss"),
-                          ("kl_loss", "kl_loss"),
-                          ("world_loss", "world_loss"),
-                          ("actor_loss", "actor_loss"),
-                          ("critic_loss", "critic_loss"),
-                          ("actor_entropy", "actor_entropy")]:
-        plt.figure()
-        plt.plot(loss_log[key], label=key)
-        plt.xlabel("Update")
-        plt.ylabel(key)
-        plt.title(f"{key} over updates")
-        plt.legend()
-        plt.savefig(f"results/{save_prefix}_{filename}.png")
-        plt.close()
-
 class RepeatActionAndMaxFrame(gym.Wrapper):
     def __init__(self, env, repeat=4, clip_reward=True, no_ops=0, fire_first=False):
         super().__init__(env)
@@ -596,8 +572,10 @@ def train_dreamer(args):
             avg_score = np.mean(episode_history[-avg_reward_window:])
             writer.add_scalar("Reward/Average", avg_score, len(episode_history))
             print(f"[Ep {len(episode_history):05d}/{config.episodes}] Avg.Score = {avg_score:.2f}", end="\r")
+            
             if avg_score >= max(episode_history, default=-np.inf):
                 agent.save_checkpoint(save_prefix)
+    
     print(f"\nFinished training. Final Avg.Score = {avg_score:.2f}")
     writer.close()
     create_animation(args.env, agent)
