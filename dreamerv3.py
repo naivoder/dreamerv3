@@ -330,7 +330,7 @@ class DreamerV3:
         rewards = batch["reward"].unsqueeze(-1).permute(1, 0, 2)
         (priors, posteriors), features, recon, reward_pred, terminal_pred = self.world_model.observe(obs, actions)
         recon_loss = F.mse_loss(recon, obs)
-        reward_loss = F.mse_loss(reward_pred, rewards.reshape(-1, 1))
+        reward_loss = F.mse_loss(symlog(reward_pred), symlog(rewards.reshape(-1, 1)))
         dones = batch["done"].unsqueeze(-1).permute(1, 0, 2)
         terminal_loss = F.binary_cross_entropy_with_logits(terminal_pred, dones.reshape(-1, 1))
         kl_loss = 0
