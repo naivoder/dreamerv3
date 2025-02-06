@@ -36,7 +36,7 @@ def init_weights(m):
 class Config:
     def __init__(self, args):
         self.capacity = 100              # number of episodes stored
-        self.batch_size = 16             # as per paper (BS = 16)
+        self.batch_size = 256
         self.sequence_length = 64        # (SL = 64)
         self.embed_dim = 1024
         self.latent_dim = 32
@@ -535,7 +535,7 @@ def train_dreamer(args):
     
     episode_history = []
     
-    avg_reward_window = 100
+    avg_reward_window = 50
     score, step = 0, 0
     state, _ = env.reset()
     agent.init_hidden_state()
@@ -547,34 +547,37 @@ def train_dreamer(args):
         agent.store_transition(state, action, reward, next_state, done)
         score += reward
         
-        if len(agent.replay_buffer) > config.min_buffer_size and step % 10 == 0:
-            losses = agent.train()
-            writer.add_scalar("Loss/World", losses["world_loss"], step)
-            writer.add_scalar("Loss/Recon", losses["recon_loss"], step)
-            writer.add_scalar("Loss/Reward", losses["reward_loss"], step)
-            writer.add_scalar("Loss/Terminal", losses["terminal_loss"], step)
-            writer.add_scalar("Loss/KL", losses["kl_loss"], step)
-            writer.add_scalar("Loss/Actor", losses["actor_loss"], step)
-            writer.add_scalar("Loss/Critic", losses["critic_loss"], step)
-            writer.add_scalar("Entropy/Actor", losses["actor_entropy"], step)
         step += 1
         
         if done:
+            ep = len(episode_history)
             episode_history.append(score)
-            writer.add_scalar("Reward/Score", score, len(episode_history))
+            if len(agent.replay_buffer) > config.min_buffer_size:
+                losses = agent.train()
+                writer.add_scalar("Loss/World", losses["world_loss"], ep)
+                writer.add_scalar("Loss/Recon", losses["recon_loss"], ep)
+                writer.add_scalar("Loss/Reward", losses["reward_loss"], ep)
+                writer.add_scalar("Loss/Terminal", losses["terminal_loss"], ep)
+                writer.add_scalar("Loss/KL", losses["kl_loss"], ep)
+                writer.add_scalar("Loss/Actor", losses["actor_loss"], ep)
+                writer.add_scalar("Loss/Critic", losses["critic_loss"], ep)
+                writer.add_scalar("Entropy/Actor", losses["actor_entropy"], ep)
+            writer.add_scalar("Reward/Score", score, ep)
+            avg_score = np.mean(episode_history[-avg_reward_window:])
+            writer.add_scalar("Reward/Average", avg_score, ep)
+            
+            print(f"[Ep {ep:05d}/{config.episodes}] Score = {score:.2f} Avg.Score = {avg_score:.2f}", end="\r")
+            
+            if score >= max(episode_history, default=-np.inf):
+                agent.save_checkpoint(save_prefix)
+
             score = 0
             agent.init_hidden_state()
             state, _ = env.reset()
         else:
             state = next_state
 
-        if episode_history:
-            avg_score = np.mean(episode_history[-avg_reward_window:])
-            writer.add_scalar("Reward/Average", avg_score, len(episode_history))
-            print(f"[Ep {len(episode_history):05d}/{config.episodes}] Avg.Score = {avg_score:.2f}", end="\r")
             
-            if avg_score >= max(episode_history, default=-np.inf):
-                agent.save_checkpoint(save_prefix)
     
     print(f"\nFinished training. Final Avg.Score = {avg_score:.2f}")
     writer.close()
