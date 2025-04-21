@@ -1,5 +1,6 @@
 import os
 import cv2
+import ale_py
 import gymnasium as gym
 import numpy as np
 import torch
@@ -13,6 +14,8 @@ from torch.utils.tensorboard import SummaryWriter
 import warnings
 
 warnings.simplefilter("ignore")
+
+gym.register_envs(ale_py)
 
 def preprocess(image):
     return image.astype(np.float32) / 255.0
@@ -659,7 +662,7 @@ def save_animation(frames, filename):
             writer.append_data(frame)
 
 def create_animation(env_name, agent, seeds=5):
-    env = AtariEnv(env_name, shape=(64, 64), repeat=4, clip_rewards=False).make()
+    env = AtariEnv("ALE/"+env_name, shape=(64, 64), repeat=4, clip_rewards=False).make()
     save_prefix = env_name.split("/")[-1]
     agent.load_checkpoint(save_prefix)
     best_total_reward, best_frames = float("-inf"), None
