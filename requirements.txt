@@ -10,3 +10,4 @@ pandas
 psutil
 zmq
 termcolor
+opencv-python 
