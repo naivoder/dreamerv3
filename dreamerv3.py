@@ -324,9 +324,9 @@ class Actor(nn.Module):
     def __init__(self, feature_dim, action_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(feature_dim, 200), nn.LayerNorm(200), nn.ReLU(),
-            nn.Linear(200, 200), nn.LayerNorm(200), nn.ReLU(),
-            nn.Linear(200, action_dim))
+            nn.Linear(feature_dim, 1024), nn.LayerNorm(1024), nn.ReLU(),
+            nn.Linear(1024, 1024), nn.LayerNorm(1024), nn.ReLU(),
+            nn.Linear(1024, action_dim))
         self.apply(init_weights)
 
     def forward(self, x):
@@ -336,9 +336,9 @@ class Critic(nn.Module):
     def __init__(self, feature_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(feature_dim, 200), nn.LayerNorm(200), nn.ReLU(),
-            nn.Linear(200, 200), nn.LayerNorm(200), nn.ReLU(),
-            nn.Linear(200, 1))
+            nn.Linear(feature_dim, 1024), nn.LayerNorm(1024), nn.ReLU(),
+            nn.Linear(1024, 1024), nn.LayerNorm(1024), nn.ReLU(),
+            nn.Linear(1024, 1))
         self.apply(init_weights)
 
     def forward(self, x):
