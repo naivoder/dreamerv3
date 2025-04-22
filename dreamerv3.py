@@ -38,9 +38,9 @@ def init_weights(m):
 
 class Config:
     def __init__(self, args):
-        self.capacity = 100_000          # Increase buffer capacity on larger machine...
-        self.batch_size = 4     # 16 or more on larger machine...               
-        self.sequence_length = 32 # 64 on larger machine     
+        self.capacity = 1_000_000         # Increase buffer capacity on larger machine...
+        self.batch_size = 16             # 16 or more on larger machine...               
+        self.sequence_length = 8       # 64 on larger machine     
         self.embed_dim = 1024
         self.latent_dim = 32
         self.num_classes = 32
@@ -51,57 +51,60 @@ class Config:
         self.critic_lr = 3e-4
         self.discount = 0.99
         self.kl_scale = 0.1
-        self.imagination_horizon = 15
+        self.imagination_horizon = 15       # 15 is correct 
         self.min_buffer_size = 5000        
         self.episodes = args.episodes
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.free_bits = 1.0            
         self.entropy_coef = 0.001         
-        self.updates_per_step = 5         
+        self.updates_per_step = 1       # 5 on larger machine...        
         self.grad_clip = 100.0            
 
 class ReplayBuffer:
-    def __init__(self, config, device):
+    def __init__(self, config, device, obs_shape):
         self.capacity = config.capacity
         self.batch_size = config.batch_size
         self.sequence_length = config.sequence_length
-        self.buffer = deque(maxlen=config.capacity)
         self.device = device
+        self.obs_shape = obs_shape
+        
+        self.obs_buf = np.zeros((config.capacity, *obs_shape), dtype=np.uint8)
+        self.act_buf = np.zeros(config.capacity, dtype=np.int64)
+        self.rew_buf = np.zeros(config.capacity, dtype=np.float32)
+        self.done_buf = np.zeros(config.capacity, dtype=np.bool_)
+        self.pos = 0
+        self.full = False
 
-    def store(self, obs, act, rew, next_obs, done):
-        self.buffer.append({
-            "obs": quantize(obs),
-            "action": act,
-            "reward": rew,
-            "next_obs": next_obs,
-            "done": done,
-        })
+    def store(self, obs, act, rew, done):
+        idx = self.pos % self.capacity
+        self.obs_buf[idx] = obs
+        self.act_buf[idx] = act
+        self.rew_buf[idx] = rew
+        self.done_buf[idx] = done
+        self.pos += 1
+        if self.pos >= self.capacity:
+            self.full = True
+            self.pos = 0
 
     def sample(self):
-        indices = np.random.randint(0, len(self.buffer) - self.sequence_length, size=self.batch_size)
-        batches = []
-        for idx in indices:
-            batch = []
-            for i in range(self.sequence_length):
-                transition = self.buffer[idx + i]
-                batch.append((
-                    preprocess(transition["obs"]),
-                    transition["action"],
-                    transition["reward"],
-                    transition["done"]
-                ))
-            batches.append(batch)
+        current_size = self.capacity if self.full else self.pos
+        valid_end = current_size - self.sequence_length
         
-        obs, actions, rewards, dones = zip(*[zip(*batch) for batch in batches])
+        start_indices = np.random.randint(0, valid_end, size=self.batch_size)
+        indices = (start_indices[:, None] + np.arange(self.sequence_length)) % self.capacity
+        
+        obs = torch.as_tensor(self.obs_buf[indices], dtype=torch.float32, device=self.device)
+        obs = obs.div_(255.0).permute(1, 0, 2, 3, 4)
+        
         return {
-            "observation": torch.tensor(np.array(obs), dtype=torch.float32, device=self.device),
-            "action": torch.tensor(np.array(actions), dtype=torch.long, device=self.device),
-            "reward": torch.tensor(np.array(rewards), dtype=torch.float32, device=self.device),
-            "done": torch.tensor(np.array(dones), dtype=torch.float32, device=self.device),
+            "observation": obs,
+            "action": torch.as_tensor(self.act_buf[indices], dtype=torch.long, device=self.device).permute(1, 0),
+            "reward": torch.as_tensor(self.rew_buf[indices], dtype=torch.float32, device=self.device).permute(1, 0),
+            "done": torch.as_tensor(self.done_buf[indices], dtype=torch.float32, device=self.device).permute(1, 0),
         }
 
     def __len__(self):
-        return len(self.buffer)
+        return self.capacity if self.full else self.pos
 
 class OneHotCategoricalStraightThrough(Categorical):
     def sample(self, sample_shape=torch.Size()):
@@ -385,7 +388,7 @@ class DreamerV3:
         self.obs_shape = obs_shape
         self.action_dim = action_dim
         self.config = config
-        self.replay_buffer = ReplayBuffer(config, config.device)
+        self.replay_buffer = ReplayBuffer(config, config.device, obs_shape)
         self.device = config.device
         
         self.world_model = WorldModel(
@@ -441,8 +444,8 @@ class DreamerV3:
         
         return int(action.item())
 
-    def store_transition(self, obs, action, reward, next_obs, done):
-        self.replay_buffer.store(obs, action, reward, next_obs, done)
+    def store_transition(self, obs, action, reward, done):
+        self.replay_buffer.store(obs, action, reward, done)
 
     def update_world_model(self, batch):
         obs = batch["observation"].permute(1, 0, 2, 3, 4)  
@@ -468,7 +471,7 @@ class DreamerV3:
         for prior, posterior in zip(priors, posteriors):
             kl_t = torch.distributions.kl_divergence(posterior, prior)
             kl_t = torch.mean(kl_t, dim=0)  # Average over batch, keep latents
-            kl_t = torch.sum(torch.max(kl_t, free_bits))
+            kl_t = torch.sum(torch.clamp(kl_t, min=free_bits))
             kl_loss += kl_t
         kl_loss /= len(priors)
         
@@ -707,7 +710,7 @@ def train_dreamer(args):
         action = agent.act(state)
         next_state, reward, term, trunc, _ = env.step(action)
         done = term or trunc
-        agent.store_transition(state, action, reward, next_state, done)
+        agent.store_transition(state, action, reward, done)
         score += reward
         
         step += 1
