@@ -39,7 +39,7 @@ def init_weights(m):
 
 class Config:
     def __init__(self, args):
-        self.capacity = 1_000_000
+        self.capacity = 500_000
         self.batch_size = 2 # 16
         self.sequence_length = 32 # 64 on machine with more RAM...
         self.embed_dim = 1024
@@ -51,13 +51,13 @@ class Config:
         self.actor_lr = 3e-5
         self.critic_lr = 3e-5
         self.discount = 0.99
-        self.kl_scale = 0.1 # 1.0
+        self.kl_scale = 1.0 # 0.1
         self.imagination_horizon = 15
         self.min_buffer_size = 5000
         self.episodes = args.episodes
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.free_bits = 1.0
-        self.entropy_coef = 0.001 # 0.01 
+        self.entropy_coef = 0.01 # 0.001 
         self.updates_per_step = 10
         self.grad_clip = 100.0
         self.mixed_precision = True
