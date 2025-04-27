@@ -39,7 +39,7 @@ def init_weights(m):
 
 class Config:
     def __init__(self, args):
-        self.capacity = 500_000
+        self.capacity = 1_000_000
         self.batch_size = 2 # 16
         self.sequence_length = 32 # 64 on machine with more RAM...
         self.embed_dim = 1024
@@ -196,17 +196,17 @@ class RSSM(nn.Module):
         
         # Separate networks for prior and posterior
         self.prior_net = nn.Sequential(
-            nn.Linear(deter_dim, 1024),
-            nn.LayerNorm(1024),
+            nn.Linear(deter_dim, 200),
+            nn.LayerNorm(200),
             nn.ReLU(),
-            nn.Linear(1024, latent_dim * num_classes)
+            nn.Linear(200, latent_dim * num_classes)
         )
         
         self.post_net = nn.Sequential(
-            nn.Linear(deter_dim + embed_dim, 1024),
-            nn.LayerNorm(1024),
+            nn.Linear(deter_dim + embed_dim, 200),
+            nn.LayerNorm(200),
             nn.ReLU(),
-            nn.Linear(1024, latent_dim * num_classes)
+            nn.Linear(200, latent_dim * num_classes)
         )
         
         self.gru = nn.GRUCell(latent_dim * num_classes + action_dim, deter_dim)
@@ -326,9 +326,9 @@ class Actor(nn.Module):
     def __init__(self, feature_dim, action_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(feature_dim, 1024), nn.LayerNorm(1024), nn.ReLU(),
-            nn.Linear(1024, 1024), nn.LayerNorm(1024), nn.ReLU(),
-            nn.Linear(1024, action_dim))
+            nn.Linear(feature_dim, 200), nn.LayerNorm(200), nn.ReLU(),
+            nn.Linear(200, 200), nn.LayerNorm(200), nn.ReLU(),
+            nn.Linear(200, action_dim))
         self.apply(init_weights)
 
     def forward(self, x):
@@ -338,9 +338,9 @@ class Critic(nn.Module):
     def __init__(self, feature_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(feature_dim, 1024), nn.LayerNorm(1024), nn.ReLU(),
-            nn.Linear(1024, 1024), nn.LayerNorm(1024), nn.ReLU(),
-            nn.Linear(1024, 1))
+            nn.Linear(feature_dim, 200), nn.LayerNorm(200), nn.ReLU(),
+            nn.Linear(200, 200), nn.LayerNorm(200), nn.ReLU(),
+            nn.Linear(200, 1))
         self.apply(init_weights)
 
     def forward(self, x):
