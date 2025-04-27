@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import imageio
+from datetime import datetime
 from collections import deque
 from torch.distributions import Categorical, Independent
 from torch.utils.tensorboard import SummaryWriter
@@ -38,26 +39,26 @@ def init_weights(m):
 
 class Config:
     def __init__(self, args):
-        self.capacity = 500_000
+        self.capacity = 1_000_000
         self.batch_size = 2 # 16
-        self.sequence_length = 64 # 64 on machine with more RAM...
-        self.embed_dim = 512 # 1024
-        self.latent_dim = 16 # 32
-        self.num_classes = 16 # 32
-        self.deter_dim = 245 # 512
-        self.lr = 4e-5
+        self.sequence_length = 32 # 64 on machine with more RAM...
+        self.embed_dim = 1024
+        self.latent_dim = 32
+        self.num_classes = 32
+        self.deter_dim = 512
+        self.lr = 3e-4
         self.eps = 1e-5
-        self.actor_lr = 3e-4
-        self.critic_lr = 3e-4
+        self.actor_lr = 3e-5
+        self.critic_lr = 3e-5
         self.discount = 0.99
-        self.kl_scale = 0.1
+        self.kl_scale = 0.1 # 1.0
         self.imagination_horizon = 15
         self.min_buffer_size = 5000
         self.episodes = args.episodes
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.free_bits = 1.0
-        self.entropy_coef = 0.001
-        self.updates_per_step = 5
+        self.entropy_coef = 0.001 # 0.01 
+        self.updates_per_step = 10
         self.grad_clip = 100.0
         self.mixed_precision = True
 
@@ -183,6 +184,7 @@ class TwoHotCategoricalStraightThrough(torch.distributions.Distribution):
     @property
     def mean(self):
         return symexp((F.softmax(self.logits, dim=-1) * self.bin_centers).sum(-1, keepdim=True))
+
 class RSSM(nn.Module):
     def __init__(self, action_dim, latent_dim, num_classes, deter_dim, embed_dim):
         super().__init__()
@@ -284,7 +286,7 @@ class WorldModel(nn.Module):
         self.continue_decoder = nn.Sequential(nn.Linear(deter_dim + latent_dim * num_classes, 1), nn.Sigmoid())
 
     def observe(self, observations, actions):
-        with autocast():
+        with torch.amp.autocast("cuda"):
             embed = self.encoder(observations.flatten(0, 1)).view(actions.size(0), actions.size(1), -1)
             actions_onehot = F.one_hot(actions, self.rssm.action_dim).float()
             
@@ -366,7 +368,7 @@ class DreamerV3:
             'actor': optim.Adam(self.actor.parameters(), lr=config.actor_lr),
             'critic': optim.Adam(self.critic.parameters(), lr=config.critic_lr)
         }
-        self.scalers = {k: GradScaler() for k in self.optimizers}
+        self.scalers = {k: torch.amp.GradScaler("CUDA") for k in self.optimizers}
         
         self.hidden_state = None
         self.step = 0
@@ -404,14 +406,14 @@ class DreamerV3:
     def update_world_model(self, batch):
         self.optimizers['world'].zero_grad()
         
-        with autocast():
+        with torch.amp.autocast("cuda"):
             (priors, posteriors), features, recon_dist, reward_dist, continue_pred = self.world_model.observe(
                 batch['observation'], batch['action'])
             
             # Calculate losses
             recon_loss = -recon_dist.log_prob((batch['observation'] * 255).long().flatten(0, 1)).mean()
             reward_loss = -reward_dist.log_prob(batch['reward'].flatten(0, 1)).mean()
-            continue_loss = F.binary_cross_entropy(continue_pred.flatten(0, 1), (1 - batch['done'].flatten(0, 1)))
+            continue_loss = F.binary_cross_entropy_with_logits(continue_pred.flatten(0, 1), (1 - batch['done'].flatten(0, 1)))
             
             # KL loss with free bits
             kl_loss = 0
@@ -441,7 +443,7 @@ class DreamerV3:
         B = self.config.batch_size
         init_state = self.world_model.rssm.init_state(B, self.device)
         
-        with torch.no_grad(), autocast():
+        with torch.no_grad(), torch.amp.autocast("cuda"):
             features, actions = self.world_model.rssm.imagine(init_state, self.actor, self.config.imagination_horizon)
             
             # Predict rewards and continues
@@ -458,7 +460,7 @@ class DreamerV3:
         
         # Critic update
         self.optimizers['critic'].zero_grad()
-        with autocast():
+        with torch.amp.autocast("cuda"):
             values = self.critic(features_flat).reshape(T, B)
             
             returns = torch.zeros_like(values)
@@ -475,7 +477,7 @@ class DreamerV3:
         
         # Actor update
         self.optimizers['actor'].zero_grad()
-        with autocast():
+        with torch.amp.autocast("cuda"):
             advantages = returns - values
             action_dist = self.actor(features_flat)
             log_probs = action_dist.log_prob(actions.reshape(-1))
@@ -619,7 +621,7 @@ def save_animation(frames, filename):
             writer.append_data(frame)
 
 def create_animation(env_name, agent, seeds=5):
-    env = AtariEnv("ALE/"+env_name, shape=(64, 64), repeat=4, clip_rewards=False).make()
+    env = AtariEnv(env_name, shape=(64, 64), repeat=4, clip_rewards=False).make()
     save_prefix = env_name.split("/")[-1]
     agent.load_checkpoint(save_prefix)
     best_total_reward, best_frames = float("-inf"), None
@@ -651,12 +653,21 @@ def train_dreamer(args):
     agent.world_model.apply(init_weights)
     agent.actor.apply(init_weights)
     agent.critic.apply(init_weights)
-    writer = SummaryWriter(log_dir=f"metrics/{save_prefix}")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    writer = SummaryWriter(log_dir=f"metrics/{save_prefix}_{timestamp}")
+
+    for key, value in vars(config).items():
+        if isinstance(value, (int, float)):
+            writer.add_scalar(f'config/{key}', value, 0)  
+        else:
+            writer.add_text(f'config/{key}', str(value), 0)
     
     episode_history = []
     
     avg_reward_window = 50
     score, step = 0, 0
+    best_avg = float("-inf")
     state, _ = env.reset()
     agent.init_hidden_state()
     
@@ -689,7 +700,11 @@ def train_dreamer(args):
             print(f"[Ep {ep:05d}/{config.episodes}] Score = {score:.2f} Avg.Score = {avg_score:.2f}", end="\r")
             
             if score >= max(episode_history, default=-np.inf):
-                agent.save_checkpoint(save_prefix)
+                agent.save_checkpoint(save_prefix+"_best")
+
+            if avg_score >= best_avg:
+                best_avg = avg_score
+                agent.save_checkpoint(save_prefix+"_best_avg")
 
             score = 0
             agent.init_hidden_state()
@@ -698,7 +713,9 @@ def train_dreamer(args):
             state = next_state
     
     print(f"\nFinished training. Final Avg.Score = {avg_score:.2f}")
+    agent.save_checkpoint(save_prefix+"_final")
     writer.close()
+    env.close()
     create_animation(args.env, agent)
 
 if __name__ == "__main__":
