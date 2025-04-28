@@ -5,6 +5,7 @@ import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 import torch.nn.functional as F
 import torch.optim as optim
 import imageio
@@ -40,8 +41,9 @@ def init_weights(m):
 class Config:
     def __init__(self, args):
         self.capacity = 1_000_000
-        self.batch_size = 2 # 16
-        self.sequence_length = 32 # 64 on machine with more RAM...
+        self.batch_size = 1 # 16
+        self.micro_batches = 16 # gradient checkpointing for smaller batch sizes
+        self.sequence_length = 64 # 64 on machine with more RAM...
         self.embed_dim = 1024
         self.latent_dim = 32
         self.num_classes = 32
@@ -196,17 +198,17 @@ class RSSM(nn.Module):
         
         # Separate networks for prior and posterior
         self.prior_net = nn.Sequential(
-            nn.Linear(deter_dim, 200),
-            nn.LayerNorm(200),
-            nn.ReLU(),
-            nn.Linear(200, latent_dim * num_classes)
+            nn.Linear(deter_dim, 1024),
+            nn.LayerNorm(1024),
+            nn.SiLU(),
+            nn.Linear(1024, latent_dim * num_classes)
         )
         
         self.post_net = nn.Sequential(
-            nn.Linear(deter_dim + embed_dim, 200),
-            nn.LayerNorm(200),
-            nn.ReLU(),
-            nn.Linear(200, latent_dim * num_classes)
+            nn.Linear(deter_dim + embed_dim, 1024),
+            nn.LayerNorm(1024),
+            nn.SiLU(),
+            nn.Linear(1024, latent_dim * num_classes)
         )
         
         self.gru = nn.GRUCell(latent_dim * num_classes + action_dim, deter_dim)
@@ -297,13 +299,11 @@ class WorldModel(nn.Module):
             for t in range(actions.size(0)):
                 deter = self.rssm.gru(torch.cat([stoch.flatten(1), actions_onehot[t]], dim=1), deter)
                 
-                # Get prior from prior network
                 prior_logits = self.rssm.prior_net(deter).view(deter.size(0), 
                                                              self.rssm.latent_dim, 
                                                              self.rssm.num_classes)
                 prior_dist = Independent(OneHotCategoricalStraightThrough(logits=prior_logits), 1)
                 
-                # Get posterior from posterior network
                 post_logits = self.rssm.post_net(torch.cat([deter, embed[t]], dim=1))
                 post_logits = post_logits.view(deter.size(0), 
                                              self.rssm.latent_dim, 
@@ -326,9 +326,9 @@ class Actor(nn.Module):
     def __init__(self, feature_dim, action_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(feature_dim, 200), nn.LayerNorm(200), nn.ReLU(),
-            nn.Linear(200, 200), nn.LayerNorm(200), nn.ReLU(),
-            nn.Linear(200, action_dim))
+            nn.Linear(feature_dim, 1024), nn.LayerNorm(1024), nn.SiLU(),
+            nn.Linear(1024, 1024), nn.LayerNorm(1024), nn.SiLU(),
+            nn.Linear(1024, action_dim))
         self.apply(init_weights)
 
     def forward(self, x):
@@ -338,9 +338,9 @@ class Critic(nn.Module):
     def __init__(self, feature_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(feature_dim, 200), nn.LayerNorm(200), nn.ReLU(),
-            nn.Linear(200, 200), nn.LayerNorm(200), nn.ReLU(),
-            nn.Linear(200, 1))
+            nn.Linear(feature_dim, 1024), nn.LayerNorm(1024), nn.SiLU(),
+            nn.Linear(1024, 1024), nn.LayerNorm(1024), nn.SiLU(),
+            nn.Linear(1024, 1))
         self.apply(init_weights)
 
     def forward(self, x):
@@ -353,6 +353,7 @@ class DreamerV3:
         self.config = config
         self.replay_buffer = ReplayBuffer(config, config.device, obs_shape)
         self.device = config.device
+        self.micro_batches = getattr(config, 'micro_batches', 16)
         
         self.world_model = WorldModel(
             obs_shape[0], action_dim, config.embed_dim, config.latent_dim,
@@ -403,124 +404,112 @@ class DreamerV3:
     def store_transition(self, obs, action, reward, done):
         self.replay_buffer.store(quantize(obs), action, reward, done)
 
-    def update_world_model(self, batch):
-        self.optimizers['world'].zero_grad()
+    def _world_loss(self, obs, act, rew, done):
+        (priors, posteriors), features, recon_dist, reward_dist, cont_pred = \
+            self.world_model.observe(obs, act)
         
-        with torch.amp.autocast("cuda"):
-            (priors, posteriors), features, recon_dist, reward_dist, continue_pred = self.world_model.observe(
-                batch['observation'], batch['action'])
-            
-            # Calculate losses
-            recon_loss = -recon_dist.log_prob((batch['observation'] * 255).long().flatten(0, 1)).mean()
-            reward_loss = -reward_dist.log_prob(batch['reward'].flatten(0, 1)).mean()
-            continue_loss = F.binary_cross_entropy_with_logits(continue_pred.flatten(0, 1), (1 - batch['done'].flatten(0, 1)))
-            
-            # KL loss with free bits
-            kl_loss = 0
-            for prior, posterior in zip(priors, posteriors):
-                kl_t = torch.distributions.kl_divergence(posterior, prior)
-                kl_t = torch.mean(kl_t, dim=0)  # Average over batch, keep latents
-                kl_t = torch.sum(torch.clamp(kl_t, min=self.config.free_bits))
-                kl_loss += kl_t
-            kl_loss /= len(priors)
-            
-            total_loss = recon_loss + reward_loss + continue_loss + self.config.kl_scale * kl_loss
-        
-        self.scalers['world'].scale(total_loss).backward()
-        torch.nn.utils.clip_grad_norm_(self.world_model.parameters(), self.config.grad_clip)
-        self.scalers['world'].step(self.optimizers['world'])
-        self.scalers['world'].update()
-        
-        return {
-            "world_loss": total_loss.item(),
-            "recon_loss": recon_loss.item(),
-            "reward_loss": reward_loss.item(),
-            "continue_loss": continue_loss.item(),
-            "kl_loss": kl_loss.item()
-        }
+        recon = -recon_dist.log_prob((obs * 255).long().flatten(0,1)).mean()
+        rloss = -reward_dist.log_prob(rew.flatten(0,1)).mean()
+        closs = F.binary_cross_entropy_with_logits(cont_pred.flatten(0,1),
+                                                  (1 - done).flatten(0,1))
+        k = 0
+        for p, q in zip(priors, posteriors):
+            kl_t = torch.distributions.kl_divergence(q, p)
+            kl_t = kl_t.mean(0).sum().clamp_min(self.config.free_bits)
+            k += kl_t
+        k = k / len(priors)
+        total = recon + rloss + closs + self.config.kl_scale * k
+        return total, recon, rloss, closs, k
+
+    def update_world_model(self):
+        opt = self.optimizers['world']
+        scaler = self.scalers['world']
+        opt.zero_grad()
+        stats = {'world_loss':0, 'recon_loss':0,
+                 'reward_loss':0, 'continue_loss':0, 'kl_loss':0}
+        for _ in range(self.micro_batches):
+            batch = self.replay_buffer.sample()
+            obs, act = batch['observation'], batch['action']
+            rew, done = batch['reward'], batch['done']
+            with torch.amp.autocast("cuda"):
+                total, r, rr, c, k = checkpoint(self._world_loss,
+                                                obs, act, rew, done)
+                total = total / self.micro_batches
+            scaler.scale(total).backward()
+            stats['world_loss']    += total.item()
+            stats['recon_loss']    += (r    / self.micro_batches).item()
+            stats['reward_loss']   += (rr   / self.micro_batches).item()
+            stats['continue_loss'] += (c    / self.micro_batches).item()
+            stats['kl_loss']       += (k    / self.micro_batches).item()
+        torch.nn.utils.clip_grad_norm_(self.world_model.parameters(),
+                                       self.config.grad_clip)
+        scaler.step(opt)
+        scaler.update()
+        return stats
+    
+    def _actor_critic_loss(self, features, actions, rewards, continues, discounts):
+        T, B, D = features.shape
+        flat = features.reshape(-1, D)
+        # critic
+        values = self.critic(flat).reshape(T, B)
+        returns = torch.zeros_like(values)
+        last = values[-1]
+        for t in reversed(range(T)):
+            last = returns[t] = rewards[t] + discounts[t] * last
+        cl = F.mse_loss(values, returns.detach())
+        # actor
+        logp = self.actor(flat).log_prob(actions.reshape(-1))
+        adv  = (returns - values).reshape(-1).detach()
+        ent  = self.actor(flat).entropy().mean()
+        al = -(logp * adv).mean() - self.config.entropy_coef * ent
+        return al, cl, ent
 
     def update_actor_and_critic(self):
-        B = self.config.batch_size
-        init_state = self.world_model.rssm.init_state(B, self.device)
-        
-        with torch.no_grad(), torch.amp.autocast("cuda"):
-            features, actions = self.world_model.rssm.imagine(init_state, self.actor, self.config.imagination_horizon)
-            
-            # Predict rewards and continues
-            reward_dist = TwoHotCategoricalStraightThrough(self.world_model.reward_decoder(features.flatten(0, 1)))
-            continue_pred = self.world_model.continue_decoder(features.flatten(0, 1))
-            
-            rewards = reward_dist.mean.view_as(actions)
-            continues = continue_pred.view_as(actions)
-            discounts = self.config.discount * continues
-        
-        # Calculate lambda returns
-        T, B, feat_dim = features.shape
-        features_flat = features.reshape(-1, feat_dim)
-        
-        # Critic update
-        self.optimizers['critic'].zero_grad()
-        with torch.amp.autocast("cuda"):
-            values = self.critic(features_flat).reshape(T, B)
-            
-            returns = torch.zeros_like(values)
-            last = values[-1]
-            for t in reversed(range(T)):
-                last = returns[t] = rewards[t] + discounts[t] * last
-            
-            critic_loss = F.mse_loss(values, returns.detach())
-        
-        self.scalers['critic'].scale(critic_loss).backward()
-        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.config.grad_clip)
-        self.scalers['critic'].step(self.optimizers['critic'])
-        self.scalers['critic'].update()
-        
-        # Actor update
-        self.optimizers['actor'].zero_grad()
-        with torch.amp.autocast("cuda"):
-            advantages = returns - values
-            action_dist = self.actor(features_flat)
-            log_probs = action_dist.log_prob(actions.reshape(-1))
-            entropy = action_dist.entropy().mean()
-            
-            actor_loss = -(log_probs * advantages.reshape(-1).detach()).mean() - self.config.entropy_coef * entropy
-        
-        self.scalers['actor'].scale(actor_loss).backward()
-        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.config.grad_clip)
-        self.scalers['actor'].step(self.optimizers['actor'])
-        self.scalers['actor'].update()
-        
-        return {
-            "actor_loss": actor_loss.item(),
-            "critic_loss": critic_loss.item(),
-            "actor_entropy": entropy.item()
-        }
+        opt_a = self.optimizers['actor']
+        opt_c = self.optimizers['critic']
+        scaler_a = self.scalers['actor']
+        scaler_c = self.scalers['critic']
+        opt_a.zero_grad(); opt_c.zero_grad()
+        stats = {'actor_loss':0, 'critic_loss':0, 'actor_entropy':0}
+        for _ in range(self.micro_batches):
+            # imagine
+            init = self.world_model.rssm.init_state(self.config.batch_size,
+                                                    self.device)
+            with torch.no_grad(), torch.amp.autocast("cuda"):
+                feats, acts = self.world_model.rssm.imagine(
+                    init, self.actor, self.config.imagination_horizon)
+                rd = self.world_model.reward_decoder(feats.flatten(0,1))
+                cd = self.world_model.continue_decoder(feats.flatten(0,1))
+                rewards = TwoHotCategoricalStraightThrough(rd).mean.view_as(acts)
+                conts   = cd.view_as(acts)
+                discs   = self.config.discount * conts
+            with torch.amp.autocast("cuda"):
+                al, cl, ent = checkpoint(self._actor_critic_loss,
+                                          feats, acts, rewards, conts, discs)
+                al = al / self.micro_batches
+                cl = cl / self.micro_batches
+            scaler_c.scale(cl).backward()
+            scaler_a.scale(al).backward()
+            stats['actor_loss']   += al.item()
+            stats['critic_loss']  += cl.item()
+            stats['actor_entropy']+= ent.item() / self.micro_batches
+        # clip & step critic
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(),
+                                       self.config.grad_clip)
+        scaler_c.step(opt_c); scaler_c.update()
+        # clip & step actor
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(),
+                                       self.config.grad_clip)
+        scaler_a.step(opt_a); scaler_a.update()
+        return stats
 
     def train(self):
         if len(self.replay_buffer) < self.config.min_buffer_size:
             return None
-        
-        losses = {
-            "world_loss": 0, "recon_loss": 0, "reward_loss": 0,
-            "continue_loss": 0, "kl_loss": 0,
-            "actor_loss": 0, "critic_loss": 0, "actor_entropy": 0
-        }
-        
-        for _ in range(self.config.updates_per_step):
-            batch = self.replay_buffer.sample()
-            
-            # World model update
-            wm_losses = self.update_world_model(batch)
-            for k, v in wm_losses.items():
-                losses[k] += v / self.config.updates_per_step
-            
-            # Actor-critic update
-            ac_losses = self.update_actor_and_critic()
-            for k, v in ac_losses.items():
-                losses[k] += v / self.config.updates_per_step
-        
+        wm_stats = self.update_world_model()
+        ac_stats = self.update_actor_and_critic()
         self.step += 1
-        return losses
+        return {**wm_stats, **ac_stats}
 
     def save_checkpoint(self, env_name):
         os.makedirs("weights", exist_ok=True)
