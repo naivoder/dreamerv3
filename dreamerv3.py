@@ -709,7 +709,8 @@ def train_dreamer(args):
             avg_score = np.mean(episode_history[-avg_reward_window:])
             writer.add_scalar("Reward/Average", avg_score, ep)
             
-            print(f"[Ep {ep:05d}/{config.episodes}] Score = {score:.2f} Avg.Score = {avg_score:.2f}", end="\r")
+            memlen = len(agent.replay_buffer)
+            print(f"[Ep {ep:05d}/{config.episodes}] Score = {score:.2f} Avg.Score = {avg_score:.2f} Mem.Length = {memlen}", end="\r")
             
             if score >= max(episode_history, default=-np.inf):
                 agent.save_checkpoint(save_prefix+"_best")
