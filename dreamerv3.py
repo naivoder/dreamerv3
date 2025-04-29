@@ -543,8 +543,8 @@ class DreamerV3:
             'step': self.step,
         }, f"weights/{env_name}_dreamerv3.pt")
 
-    def load_checkpoint(self, env_name):
-        checkpoint = torch.load(f"weights/{env_name}_dreamerv3.pt")
+    def load_checkpoint(self, env_name, mod="best"):
+        checkpoint = torch.load(f"weights/{env_name}_{mod}_dreamerv3.pt")
         self.world_model.load_state_dict(checkpoint['world_model'])
         self.actor.load_state_dict(checkpoint['actor'])
         self.critic.load_state_dict(checkpoint['critic'])
