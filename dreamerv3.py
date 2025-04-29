@@ -5,7 +5,6 @@ import gymnasium as gym
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.checkpoint import checkpoint
 import torch.nn.functional as F
 import torch.optim as optim
 import imageio
@@ -14,7 +13,6 @@ from collections import deque
 from torch.distributions import Categorical, Independent
 from torch.utils.tensorboard import SummaryWriter
 import warnings
-from torch.cuda.amp import autocast, GradScaler
 
 warnings.simplefilter("ignore")
 gym.register_envs(ale_py)
