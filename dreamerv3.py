@@ -40,9 +40,9 @@ def init_weights(m):
 
 class Config:
     def __init__(self, args):
-        self.capacity = 1_000_000
-        self.batch_size = 1 # 16
-        self.micro_batches = 16 # gradient checkpointing for smaller batch sizes
+        self.capacity = 3_000_000
+        self.batch_size = 16 # 16
+        self.micro_batches = 1 # gradient checkpointing for smaller batch sizes
         self.sequence_length = 64 # 64 on machine with more RAM...
         self.embed_dim = 1024
         self.latent_dim = 32
@@ -53,14 +53,14 @@ class Config:
         self.actor_lr = 3e-5
         self.critic_lr = 3e-5
         self.discount = 0.99
-        self.kl_scale = 1.0 # 0.1
+        self.kl_scale = 0.1 # 1.0
         self.imagination_horizon = 15
         self.min_buffer_size = 5000
         self.episodes = args.episodes
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.free_bits = 1.0
         self.entropy_coef = 0.01 # 0.001 
-        self.updates_per_step = 10
+        self.updates_per_step = 5
         self.grad_clip = 100.0
         self.mixed_precision = True
 
@@ -119,10 +119,10 @@ class ObservationEncoder(nn.Module):
     def __init__(self, in_channels, embed_dim):
         super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, 32, 4, 2), nn.ReLU(),
-            nn.Conv2d(32, 64, 4, 2), nn.ReLU(),
-            nn.Conv2d(64, 128, 4, 2), nn.ReLU(),
-            nn.Conv2d(128, 256, 4, 2), nn.ReLU(),
+            nn.Conv2d(in_channels, 32, 4, 2), nn.SiLU(),
+            nn.Conv2d(32, 64, 4, 2), nn.SiLU(),
+            nn.Conv2d(64, 128, 4, 2), nn.SiLU(),
+            nn.Conv2d(128, 256, 4, 2), nn.SiLU(),
             nn.Flatten(),
             nn.Linear(256 * 2 * 2, embed_dim),  # Corrected input dimensions
             nn.LayerNorm(embed_dim)
@@ -140,27 +140,21 @@ class ObservationDecoder(nn.Module):
         
         self.net = nn.Sequential(
             nn.Linear(feature_dim, 256*8*8),
-            nn.ReLU(),
+            nn.LayerNorm(256*8*8),
+            nn.SiLU(),
             nn.Unflatten(1, (256, 8, 8)),
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(),
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, out_channels * 255, kernel_size=3, padding=1)
+            nn.ConvTranspose2d(256, 128, 4, 2, 1), nn.SiLU(),
+            nn.ConvTranspose2d(128,  64, 4, 2, 1), nn.SiLU(),
+            nn.ConvTranspose2d( 64,  32, 4, 2, 1), nn.SiLU(),
+            nn.Conv2d(32, out_channels, 3, padding=1),
+            nn.Sigmoid()                  # bound [0,1]
         )
         self.apply(init_weights)
 
     def forward(self, x):
+        # x: (B, D) → (B, C, H, W)
         x = self.net(x)
-        batch_size = x.size(0)
-        x = x.view(batch_size, self.out_channels, 255, *self.output_size)
-        x = x.permute(0, 1, 3, 4, 2) 
-        return Independent(
-            OneHotCategoricalStraightThrough(logits=x),
-            reinterpreted_batch_ndims=3
-        )
+        return x
 
 class TwoHotCategoricalStraightThrough(torch.distributions.Distribution):
     def __init__(self, logits, bins=255, low=-20.0, high=20.0):
@@ -354,6 +348,7 @@ class DreamerV3:
         self.replay_buffer = ReplayBuffer(config, config.device, obs_shape)
         self.device = config.device
         self.micro_batches = getattr(config, 'micro_batches', 16)
+        self.rl_scale = getattr(config, 'rl_scale', 0.1)
         
         self.world_model = WorldModel(
             obs_shape[0], action_dim, config.embed_dim, config.latent_dim,
@@ -405,44 +400,81 @@ class DreamerV3:
         self.replay_buffer.store(quantize(obs), action, reward, done)
 
     def _world_loss(self, obs, act, rew, done):
-        (priors, posteriors), features, recon_dist, reward_dist, cont_pred = \
+        # 1) run encode/transition/decoder
+        (priors, posteriors), features, _, reward_dist, cont_pred = \
             self.world_model.observe(obs, act)
-        
-        recon = -recon_dist.log_prob((obs * 255).long().flatten(0,1)).mean()
-        rloss = -reward_dist.log_prob(rew.flatten(0,1)).mean()
-        closs = F.binary_cross_entropy_with_logits(cont_pred.flatten(0,1),
-                                                  (1 - done).flatten(0,1))
-        k = 0
-        for p, q in zip(priors, posteriors):
-            kl_t = torch.distributions.kl_divergence(q, p)
+
+        B, T, _ = features.shape  # e.g. [Time, Batch, feat]
+        flat_feat = features.flatten(0, 1)  # [T*B, feat]
+
+        # 2) reconstruct pixels via direct decoder + sigmoid → [T*B, C, H, W]
+        recon_pred = self.world_model.decoder(flat_feat)
+        obs_norm   = obs.float() / 255.0
+        recon_target = obs_norm.flatten(0, 1)
+
+        recon_loss = F.mse_loss(recon_pred, recon_target, reduction='mean')
+
+        # 3) reward log-prob (you can also switch this to MSE if you like)
+        reward_loss = -reward_dist.log_prob(rew.flatten(0, 1)).mean()
+
+        # 4) continue (1-done) prediction
+        cont_loss = F.binary_cross_entropy_with_logits(
+            cont_pred.flatten(0, 1),
+            (1 - done).flatten(0, 1)
+        )
+
+        # 5) KL with free-bits
+        kl_loss = 0.0
+        for prior, post in zip(priors, posteriors):
+            kl_t = torch.distributions.kl_divergence(post, prior)  # [T*B, latent]
             kl_t = kl_t.mean(0).sum().clamp_min(self.config.free_bits)
-            k += kl_t
-        k = k / len(priors)
-        total = recon + rloss + closs + self.config.kl_scale * k
-        return total, recon, rloss, closs, k
+            kl_loss += kl_t
+        kl_loss = kl_loss / len(priors)
+
+        total = (
+            recon_loss
+            + reward_loss
+            + cont_loss
+            + self.config.kl_scale * kl_loss
+        )
+        return total, recon_loss, reward_loss, cont_loss, kl_loss
 
     def update_world_model(self):
-        opt = self.optimizers['world']
+        opt    = self.optimizers['world']
         scaler = self.scalers['world']
         opt.zero_grad()
-        stats = {'world_loss':0, 'recon_loss':0,
-                 'reward_loss':0, 'continue_loss':0, 'kl_loss':0}
+
+        stats = {
+            'world_loss': 0., 'recon_loss': 0.,
+            'reward_loss': 0., 'continue_loss': 0., 'kl_loss': 0.
+        }
+
         for _ in range(self.micro_batches):
             batch = self.replay_buffer.sample()
-            obs, act = batch['observation'], batch['action']
-            rew, done = batch['reward'], batch['done']
+            obs  = batch['observation'].to(self.device).requires_grad_()
+            act  = batch['action'].to(self.device)
+            rew  = batch['reward'].to(self.device)
+            done = batch['done'].to(self.device)
+
+            # checkpoint the loss to save memory
             with torch.amp.autocast("cuda"):
-                total, r, rr, c, k = checkpoint(self._world_loss,
-                                                obs, act, rew, done)
+                total, r, rr, c, k = checkpoint(
+                    self._world_loss, obs, act, rew, done
+                )
                 total = total / self.micro_batches
+
             scaler.scale(total).backward()
+
             stats['world_loss']    += total.item()
-            stats['recon_loss']    += (r    / self.micro_batches).item()
-            stats['reward_loss']   += (rr   / self.micro_batches).item()
-            stats['continue_loss'] += (c    / self.micro_batches).item()
-            stats['kl_loss']       += (k    / self.micro_batches).item()
-        torch.nn.utils.clip_grad_norm_(self.world_model.parameters(),
-                                       self.config.grad_clip)
+            stats['recon_loss']    += (r  / self.micro_batches).item()
+            stats['reward_loss']   += (rr / self.micro_batches).item()
+            stats['continue_loss'] += (c  / self.micro_batches).item()
+            stats['kl_loss']       += (k  / self.micro_batches).item()
+
+        torch.nn.utils.clip_grad_norm_(
+            self.world_model.parameters(),
+            self.config.grad_clip
+        )
         scaler.step(opt)
         scaler.update()
         return stats
@@ -485,10 +517,10 @@ class DreamerV3:
                 discs   = self.config.discount * conts
             with torch.amp.autocast("cuda"):
                 al, cl, ent = checkpoint(self._actor_critic_loss,
-                                          feats, acts, rewards, conts, discs)
+                                          feats.requires_grad_(), acts, rewards, conts, discs)
                 al = al / self.micro_batches
                 cl = cl / self.micro_batches
-            scaler_c.scale(cl).backward()
+            scaler_c.scale(cl).backward(retain_graph=True)
             scaler_a.scale(al).backward()
             stats['actor_loss']   += al.item()
             stats['critic_loss']  += cl.item()
@@ -506,10 +538,28 @@ class DreamerV3:
     def train(self):
         if len(self.replay_buffer) < self.config.min_buffer_size:
             return None
-        wm_stats = self.update_world_model()
-        ac_stats = self.update_actor_and_critic()
+        
+        losses = {
+            "world_loss": 0, "recon_loss": 0, "reward_loss": 0,
+            "continue_loss": 0, "kl_loss": 0,
+            "actor_loss": 0, "critic_loss": 0, "actor_entropy": 0
+        }
+        
+        for _ in range(self.config.updates_per_step):
+            batch = self.replay_buffer.sample()
+            
+            # World model update
+            wm_losses = self.update_world_model(batch)
+            for k, v in wm_losses.items():
+                losses[k] += v / self.config.updates_per_step
+            
+            # Actor-critic update
+            ac_losses = self.update_actor_and_critic()
+            for k, v in ac_losses.items():
+                losses[k] += v / self.config.updates_per_step
+        
         self.step += 1
-        return {**wm_stats, **ac_stats}
+        return losses
 
     def save_checkpoint(self, env_name):
         os.makedirs("weights", exist_ok=True)
@@ -673,7 +723,8 @@ def train_dreamer(args):
             ep = len(episode_history)
             episode_history.append(score)
             if len(agent.replay_buffer) > config.min_buffer_size:
-                losses = agent.train()
+                for _ in range(config.updates_per_step):
+                    losses = agent.train()
                 writer.add_scalar("Loss/World", losses["world_loss"], ep)
                 writer.add_scalar("Loss/Recon", losses["recon_loss"], ep)
                 writer.add_scalar("Loss/Reward", losses["reward_loss"], ep)
