@@ -41,26 +41,25 @@ def init_weights(m):
 class Config:
     def __init__(self, args):
         self.capacity = 3_000_000
-        self.batch_size = 16 # 16
-        self.micro_batches = 1 # gradient checkpointing for smaller batch sizes
-        self.sequence_length = 64 # 64 on machine with more RAM...
+        self.batch_size = 16
+        self.sequence_length = 64
         self.embed_dim = 1024
         self.latent_dim = 32
         self.num_classes = 32
         self.deter_dim = 512
-        self.lr = 3e-4
+        self.lr = 4e-5
         self.eps = 1e-5
-        self.actor_lr = 3e-5
-        self.critic_lr = 3e-5
+        self.actor_lr = 3e-4
+        self.critic_lr = 3e-4
         self.discount = 0.99
-        self.kl_scale = 0.1 # 1.0
+        self.kl_scale = 1.0
         self.imagination_horizon = 15
         self.min_buffer_size = 5000
         self.episodes = args.episodes
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.free_bits = 1.0
         self.entropy_coef = 0.01 # 0.001 
-        self.updates_per_step = 5
+        self.updates_per_step = 10
         self.grad_clip = 100.0
         self.mixed_precision = True
 
@@ -347,8 +346,6 @@ class DreamerV3:
         self.config = config
         self.replay_buffer = ReplayBuffer(config, config.device, obs_shape)
         self.device = config.device
-        self.micro_batches = getattr(config, 'micro_batches', 16)
-        self.rl_scale = getattr(config, 'rl_scale', 0.1)
         
         self.world_model = WorldModel(
             obs_shape[0], action_dim, config.embed_dim, config.latent_dim,
@@ -400,140 +397,122 @@ class DreamerV3:
         self.replay_buffer.store(quantize(obs), action, reward, done)
 
     def _world_loss(self, obs, act, rew, done):
-        # 1) run encode/transition/decoder
-        (priors, posteriors), features, _, reward_dist, cont_pred = \
+        (priors, posts), features, _, reward_dist, cont_pred = \
             self.world_model.observe(obs, act)
 
-        B, T, _ = features.shape  # e.g. [Time, Batch, feat]
-        flat_feat = features.flatten(0, 1)  # [T*B, feat]
+        # flatten time & batch
+        flat = features.flatten(0, 1)
 
-        # 2) reconstruct pixels via direct decoder + sigmoid → [T*B, C, H, W]
-        recon_pred = self.world_model.decoder(flat_feat)
-        obs_norm   = obs.float() / 255.0
-        recon_target = obs_norm.flatten(0, 1)
+        # reconstruction via MSE
+        recon_pred   = self.world_model.decoder(flat)
+        recon_target = (obs.float() / 255.0).flatten(0, 1)
+        recon_loss   = F.mse_loss(recon_pred, recon_target, reduction='mean')
 
-        recon_loss = F.mse_loss(recon_pred, recon_target, reduction='mean')
-
-        # 3) reward log-prob (you can also switch this to MSE if you like)
+        # reward & continue losses
         reward_loss = -reward_dist.log_prob(rew.flatten(0, 1)).mean()
-
-        # 4) continue (1-done) prediction
-        cont_loss = F.binary_cross_entropy_with_logits(
+        cont_loss   = F.binary_cross_entropy_with_logits(
             cont_pred.flatten(0, 1),
             (1 - done).flatten(0, 1)
         )
 
-        # 5) KL with free-bits
-        kl_loss = 0.0
-        for prior, post in zip(priors, posteriors):
-            kl_t = torch.distributions.kl_divergence(post, prior)  # [T*B, latent]
+        # KL with free bits
+        kl = 0.0
+        for p, q in zip(priors, posts):
+            kl_t = torch.distributions.kl_divergence(q, p)
             kl_t = kl_t.mean(0).sum().clamp_min(self.config.free_bits)
-            kl_loss += kl_t
-        kl_loss = kl_loss / len(priors)
+            kl += kl_t
+        kl_loss = kl / len(priors)
 
-        total = (
-            recon_loss
-            + reward_loss
-            + cont_loss
-            + self.config.kl_scale * kl_loss
-        )
+        total = recon_loss + reward_loss + cont_loss + self.config.kl_scale * kl_loss
         return total, recon_loss, reward_loss, cont_loss, kl_loss
 
     def update_world_model(self):
+        if len(self.replay_buffer) < self.config.min_buffer_size:
+            return None
+
         opt    = self.optimizers['world']
         scaler = self.scalers['world']
         opt.zero_grad()
 
-        stats = {
-            'world_loss': 0., 'recon_loss': 0.,
-            'reward_loss': 0., 'continue_loss': 0., 'kl_loss': 0.
-        }
+        batch = self.replay_buffer.sample()
+        obs  = batch['observation'].to(self.device)
+        act  = batch['action'].to(self.device)
+        rew  = batch['reward'].to(self.device)
+        done = batch['done'].to(self.device)
 
-        for _ in range(self.micro_batches):
-            batch = self.replay_buffer.sample()
-            obs  = batch['observation'].to(self.device).requires_grad_()
-            act  = batch['action'].to(self.device)
-            rew  = batch['reward'].to(self.device)
-            done = batch['done'].to(self.device)
+        with torch.amp.autocast("cuda"):
+            total, r, rr, c, k = self._world_loss(obs, act, rew, done)
 
-            # checkpoint the loss to save memory
-            with torch.amp.autocast("cuda"):
-                total, r, rr, c, k = checkpoint(
-                    self._world_loss, obs, act, rew, done
-                )
-                total = total / self.micro_batches
-
-            scaler.scale(total).backward()
-
-            stats['world_loss']    += total.item()
-            stats['recon_loss']    += (r  / self.micro_batches).item()
-            stats['reward_loss']   += (rr / self.micro_batches).item()
-            stats['continue_loss'] += (c  / self.micro_batches).item()
-            stats['kl_loss']       += (k  / self.micro_batches).item()
-
-        torch.nn.utils.clip_grad_norm_(
-            self.world_model.parameters(),
-            self.config.grad_clip
-        )
+        scaler.scale(total).backward()
+        torch.nn.utils.clip_grad_norm_(self.world_model.parameters(),
+                                       self.config.grad_clip)
         scaler.step(opt)
         scaler.update()
-        return stats
-    
-    def _actor_critic_loss(self, features, actions, rewards, continues, discounts):
-        T, B, D = features.shape
-        flat = features.reshape(-1, D)
-        # critic
-        values = self.critic(flat).reshape(T, B)
-        returns = torch.zeros_like(values)
-        last = values[-1]
-        for t in reversed(range(T)):
-            last = returns[t] = rewards[t] + discounts[t] * last
-        cl = F.mse_loss(values, returns.detach())
-        # actor
-        logp = self.actor(flat).log_prob(actions.reshape(-1))
-        adv  = (returns - values).reshape(-1).detach()
-        ent  = self.actor(flat).entropy().mean()
-        al = -(logp * adv).mean() - self.config.entropy_coef * ent
-        return al, cl, ent
+
+        return {
+            'world_loss':    total.item(),
+            'recon_loss':    r.item(),
+            'reward_loss':   rr.item(),
+            'continue_loss': c.item(),
+            'kl_loss':       k.item()
+        }
 
     def update_actor_and_critic(self):
-        opt_a = self.optimizers['actor']
-        opt_c = self.optimizers['critic']
-        scaler_a = self.scalers['actor']
+        # 1) imagination (no grads through world_model)
+        with torch.no_grad(), torch.amp.autocast("cuda"):
+            init_state = self.world_model.rssm.init_state(
+                self.config.batch_size, self.device
+            )
+            feats, acts = self.world_model.rssm.imagine(
+                init_state, self.actor, self.config.imagination_horizon
+            )
+            rd = self.world_model.reward_decoder(feats.flatten(0,1))
+            cd = self.world_model.continue_decoder(feats.flatten(0,1))
+            rewards   = TwoHotCategoricalStraightThrough(rd).mean.view_as(acts)
+            continues = cd.view_as(acts)
+            discounts = self.config.discount * continues
+
+        flat = feats.reshape(-1, feats.shape[-1])
+
+        # 2) critic update
+        opt_c    = self.optimizers['critic']
         scaler_c = self.scalers['critic']
-        opt_a.zero_grad(); opt_c.zero_grad()
-        stats = {'actor_loss':0, 'critic_loss':0, 'actor_entropy':0}
-        for _ in range(self.micro_batches):
-            # imagine
-            init = self.world_model.rssm.init_state(self.config.batch_size,
-                                                    self.device)
-            with torch.no_grad(), torch.amp.autocast("cuda"):
-                feats, acts = self.world_model.rssm.imagine(
-                    init, self.actor, self.config.imagination_horizon)
-                rd = self.world_model.reward_decoder(feats.flatten(0,1))
-                cd = self.world_model.continue_decoder(feats.flatten(0,1))
-                rewards = TwoHotCategoricalStraightThrough(rd).mean.view_as(acts)
-                conts   = cd.view_as(acts)
-                discs   = self.config.discount * conts
-            with torch.amp.autocast("cuda"):
-                al, cl, ent = checkpoint(self._actor_critic_loss,
-                                          feats.requires_grad_(), acts, rewards, conts, discs)
-                al = al / self.micro_batches
-                cl = cl / self.micro_batches
-            scaler_c.scale(cl).backward(retain_graph=True)
-            scaler_a.scale(al).backward()
-            stats['actor_loss']   += al.item()
-            stats['critic_loss']  += cl.item()
-            stats['actor_entropy']+= ent.item() / self.micro_batches
-        # clip & step critic
+        opt_c.zero_grad()
+        with torch.amp.autocast("cuda"):
+            values       = self.critic(flat).reshape_as(acts)
+            returns      = torch.zeros_like(values)
+            last         = values[-1]
+            for t in reversed(range(values.shape[0])):
+                last      = returns[t] = rewards[t] + discounts[t] * last
+            critic_loss = F.mse_loss(values, returns.detach())
+        scaler_c.scale(critic_loss).backward()
         torch.nn.utils.clip_grad_norm_(self.critic.parameters(),
                                        self.config.grad_clip)
-        scaler_c.step(opt_c); scaler_c.update()
-        # clip & step actor
+        scaler_c.step(opt_c)
+        scaler_c.update()
+
+        # 3) actor update
+        opt_a    = self.optimizers['actor']
+        scaler_a = self.scalers['actor']
+        opt_a.zero_grad()
+        with torch.amp.autocast("cuda"):
+            dist        = self.actor(flat)
+            logp        = dist.log_prob(acts.reshape(-1))
+            advantage   = (returns - values).reshape(-1).detach()
+            entropy     = dist.entropy().mean()
+            actor_loss  = -(logp * advantage).mean() - self.config.entropy_coef * entropy
+        scaler_a.scale(actor_loss).backward()
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(),
                                        self.config.grad_clip)
-        scaler_a.step(opt_a); scaler_a.update()
-        return stats
+        scaler_a.step(opt_a)
+        scaler_a.update()
+
+        return {
+            'actor_loss':   actor_loss.item(),
+            'critic_loss':  critic_loss.item(),
+            'actor_entropy': entropy.item()
+        }
+
 
     def train(self):
         if len(self.replay_buffer) < self.config.min_buffer_size:
@@ -545,15 +524,11 @@ class DreamerV3:
             "actor_loss": 0, "critic_loss": 0, "actor_entropy": 0
         }
         
-        for _ in range(self.config.updates_per_step):
-            batch = self.replay_buffer.sample()
-            
-            # World model update
-            wm_losses = self.update_world_model(batch)
+        for _ in range(self.config.updates_per_step):            
+            wm_losses = self.update_world_model()
             for k, v in wm_losses.items():
                 losses[k] += v / self.config.updates_per_step
             
-            # Actor-critic update
             ac_losses = self.update_actor_and_critic()
             for k, v in ac_losses.items():
                 losses[k] += v / self.config.updates_per_step
@@ -723,8 +698,7 @@ def train_dreamer(args):
             ep = len(episode_history)
             episode_history.append(score)
             if len(agent.replay_buffer) > config.min_buffer_size:
-                for _ in range(config.updates_per_step):
-                    losses = agent.train()
+                losses = agent.train()
                 writer.add_scalar("Loss/World", losses["world_loss"], ep)
                 writer.add_scalar("Loss/Recon", losses["recon_loss"], ep)
                 writer.add_scalar("Loss/Reward", losses["reward_loss"], ep)
