@@ -38,7 +38,7 @@ def create_animation(env, agent, save_prefix, mod="best", seeds=10):
     best_total_reward, best_frames = float("-inf"), None
 
     for _ in range(seeds):
-        state, info = env.reset()
+        state, _ = env.reset()
         frames, total_reward = [], 0
         term, trunc = False, False
 
@@ -68,7 +68,7 @@ def log_losses(writer, ep, losses):
     writer.add_scalar("Entropy/Actor", losses["actor_entropy"], ep)
     writer.add_scalar("Entropy/Prior", losses["prior_entropy"], ep)
     writer.add_scalar("Entropy/Posterior", losses["posterior_entropy"], ep)
-    # writer.add_scalar("Entropy/Reward", losses["reward_entropy"], ep)
+    writer.add_scalar("Entropy/Reward", losses["reward_entropy"], ep)
 
 
 def log_rewards(writer, ep, score, avg_score, buffer_len, total_episodes):
@@ -77,7 +77,7 @@ def log_rewards(writer, ep, score, avg_score, buffer_len, total_episodes):
     writer.add_scalar("Buffer/Length", buffer_len, ep)
 
     e_str = f"[Ep {ep:05d}/{total_episodes}]"
-    s_str = f"Score = {score:4.2f}"
-    a_str = f"Avg.Score = {avg_score:4.2f}"
-    b_str = f"Mem.Length = {buffer_len:7d}"
-    print(f"{e_str}  {s_str}  {a_str}  {b_str}", end="\r")
+    s_str = f"Score = {score:8.2f}"
+    a_str = f"Avg.Score = {avg_score:8.2f}"
+    b_str = f"Mem.Length = {buffer_len:07d}"
+    print(f"{e_str} {s_str}  {a_str}  {b_str}", end="\r")
