@@ -2,7 +2,6 @@ import numpy as np
 import torch
 from torch import nn
 import imageio
-from environment import AtariEnv
 
 
 def preprocess(image):
@@ -34,25 +33,28 @@ def save_animation(frames, filename):
             writer.append_data(frame)
 
 
-def create_animation(env_name, agent, mod="best", seeds=10):
-    env = AtariEnv(env_name, shape=(64, 64), repeat=4, clip_rewards=False).make()
-    save_prefix = env_name.split("/")[-1]
+def create_animation(env, agent, save_prefix, mod="best", seeds=10):
     agent.load_checkpoint(f"weights/{save_prefix}_{mod}_dreamerv3.pt")
     best_total_reward, best_frames = float("-inf"), None
+
     for _ in range(seeds):
         state, info = env.reset()
         frames, total_reward = [], 0
         term, trunc = False, False
+
         while not (term or trunc):
             frames.append(env.render())
             action = agent.act(state)
             next_state, reward, term, trunc, _ = env.step(action)
             total_reward += reward
             state = next_state
+
         if total_reward > best_total_reward:
             best_total_reward = total_reward
             best_frames = frames
+
     save_animation(best_frames, f"environments/{save_prefix}.gif")
+    env.close()
 
 
 def log_losses(writer, ep, losses):
@@ -66,7 +68,7 @@ def log_losses(writer, ep, losses):
     writer.add_scalar("Entropy/Actor", losses["actor_entropy"], ep)
     writer.add_scalar("Entropy/Prior", losses["prior_entropy"], ep)
     writer.add_scalar("Entropy/Posterior", losses["posterior_entropy"], ep)
-    writer.add_scalar("Entropy/Reward", losses["reward_entropy"], ep)
+    # writer.add_scalar("Entropy/Reward", losses["reward_entropy"], ep)
 
 
 def log_rewards(writer, ep, score, avg_score, buffer_len, total_episodes):
@@ -74,7 +76,8 @@ def log_rewards(writer, ep, score, avg_score, buffer_len, total_episodes):
     writer.add_scalar("Reward/Average", avg_score, ep)
     writer.add_scalar("Buffer/Length", buffer_len, ep)
 
-    print(
-        f"[Ep {ep:05d}/{total_episodes}]  Score = {score:.2f}  Avg.Score = {avg_score:.2f}  Mem.Length = {buffer_len}",
-        end="\r",
-    )
+    e_str = f"[Ep {ep:05d}/{total_episodes}]"
+    s_str = f"Score = {score:4.2f}"
+    a_str = f"Avg.Score = {avg_score:4.2f}"
+    b_str = f"Mem.Length = {buffer_len:7d}"
+    print(f"{e_str}  {s_str}  {a_str}  {b_str}", end="\r")
