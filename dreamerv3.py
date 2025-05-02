@@ -144,9 +144,7 @@ class TwoHotCategoricalStraightThrough(torch.distributions.Distribution):
 
     @property
     def mean(self):
-        return utils.symexp(
-            (F.softmax(self.logits, dim=-1) * self.bin_centers).sum(-1, keepdim=True)
-        )
+        return (F.softmax(self.logits, dim=-1) * self.bin_centers).sum(-1, keepdim=True)
 
     def entropy(self):
         probs = F.softmax(self.logits, dim=-1)
@@ -575,10 +573,10 @@ class DreamerV3:
             )
             rd = self.world_model.reward_decoder(feats.flatten(0, 1))
             cd = self.world_model.continue_decoder(feats.flatten(0, 1))
-            rewards = TwoHotCategoricalStraightThrough(rd)
             rewards = utils.symexp(
-                rewards.mean, scale=self.config.symlog_scale
-            ).view_as(acts)
+                TwoHotCategoricalStraightThrough(rd).mean.view_as(acts),
+                self.config.symlog_scale,
+            )
             continues = torch.sigmoid(cd.view_as(acts)) * (
                 1 - 1 / self.config.imagination_horizon
             )
