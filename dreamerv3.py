@@ -20,7 +20,7 @@ torch.backends.cudnn.benchmark = True
 
 class Config:
     def __init__(self, args):
-        self.capacity = 1000000
+        self.capacity = 2000000
         self.batch_size = 16
         self.sequence_length = 64
         self.embed_dim = 1024
@@ -28,22 +28,22 @@ class Config:
         self.num_classes = 32
         self.deter_dim = 4096
         self.hidden_dim = 512
-        self.lr = 3e-4
+        self.lr = 4e-5
         self.eps = 1e-5
         self.actor_lr = 4e-5
         self.critic_lr = 4e-5
         self.discount = 0.99
         self.gae_lambda = 0.95
-        self.kl_scale = 1.0  # 0.1
+        self.kl_scale = 1.0
         self.kl_balance = 0.8
+        self.symlog_scale = 2.0
         self.imagination_horizon = 15
-        self.min_buffer_size = 5000
+        self.min_buffer_size = 10000
         self.episodes = args.episodes
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.free_bits = 1.0
-        self.entropy_coef = 0.001
-        self.updates_per_step = 1
-        self.train_steps = 100
+        self.entropy_coef = 0.01
+        self.updates_per_step = 5
         self.grad_clip_world = 1000.0
         self.grad_clip_ac = 100.0
         self.mixed_precision = True
@@ -57,6 +57,7 @@ class ReplayBuffer:
         self.capacity = config.capacity
         self.batch_size = config.batch_size
         self.sequence_length = config.sequence_length
+        self.symlog_scale = config.symlog_scale
         self.device = device
         self.obs_shape = obs_shape
 
@@ -92,7 +93,10 @@ class ReplayBuffer:
             self.act_buf[idxs], dtype=torch.long, device=self.device
         )
         rew_batch = utils.symlog(
-            torch.as_tensor(self.rew_buf[idxs], dtype=torch.float32, device=self.device)
+            torch.as_tensor(
+                self.rew_buf[idxs], dtype=torch.float32, device=self.device
+            ),
+            scale=self.symlog_scale,
         )
         done_batch = torch.as_tensor(
             self.done_buf[idxs], dtype=torch.float32, device=self.device
@@ -503,20 +507,6 @@ class DreamerV3:
         cont_target = (1 - done).permute(1, 0).flatten(0, 1)
         cont_loss = F.binary_cross_entropy_with_logits(cont_TB, cont_target)
 
-        # kl = 0.0
-        # for p, q in zip(priors, posts):
-        #     kl_elem = torch.distributions.kl_divergence(q, p)
-        #     kl_elem = torch.clamp_min(kl_elem, self.config.free_bits)
-        #     kl += kl_elem.sum(-1).mean()
-        # kl_loss = kl / len(priors)
-
-        # kl = torch.stack(
-        #     [torch.distributions.kl_divergence(q, p) for p, q in zip(priors, posts)]
-        # )
-        # kl = kl.mean(0).sum(-1)
-        # kl = torch.clamp_min(kl, self.config.free_bits)
-        # kl_loss = self.config.kl_balance * kl.mean()
-
         kl = torch.stack(
             [torch.distributions.kl_divergence(q, p) for p, q in zip(priors, posts)]
         )
@@ -585,7 +575,10 @@ class DreamerV3:
             )
             rd = self.world_model.reward_decoder(feats.flatten(0, 1))
             cd = self.world_model.continue_decoder(feats.flatten(0, 1))
-            rewards = TwoHotCategoricalStraightThrough(rd).mean.view_as(acts)
+            rewards = TwoHotCategoricalStraightThrough(rd)
+            rewards = utils.symexp(
+                rewards.mean, scale=self.config.symlog_scale
+            ).view_as(acts)
             continues = torch.sigmoid(cd.view_as(acts)) * (
                 1 - 1 / self.config.imagination_horizon
             )
@@ -612,7 +605,7 @@ class DreamerV3:
             )
             rev_adv = torch.cumsum(rev_deltas * rev_prod, dim=0)
             advantages = rev_adv.flip(0)
-            returns = advantages + values
+            returns = utils.symlog(advantages + rewards)
             critic_loss = F.mse_loss(values, returns.detach())
 
         scaler_c.scale(critic_loss).backward()
@@ -695,7 +688,7 @@ def train_dreamer(args):
     episode_history = []
     avg_reward_window = 100
     best_avg = float("-inf")
-    score, step = 0, 0
+    score = 0
 
     state, _ = env.reset()
     agent.init_hidden_state()
@@ -706,17 +699,15 @@ def train_dreamer(args):
         done = term or trunc
         agent.store_transition(state, action, reward, done)
         score += reward
-        step += 1
-
-        # Training
-        if len(agent.replay_buffer) >= config.min_buffer_size:
-            if step % config.train_steps == 0:
-                losses = agent.train()
-                utils.log_losses(writer, ep, losses)
 
         if done:
             episode_history.append(score)
             ep = len(episode_history)
+
+            if len(agent.replay_buffer) >= config.min_buffer_size:
+                for _ in range(config.updates_per_step):
+                    losses = agent.train()
+                utils.log_losses(writer, ep, losses)
 
             avg_score = np.mean(episode_history[-avg_reward_window:])
             buffer_len = len(agent.replay_buffer)

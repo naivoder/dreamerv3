@@ -12,12 +12,12 @@ def quantize(image):
     return (image * 255).clip(0, 255).astype(np.uint8)
 
 
-def symlog(x):
-    return torch.sign(x) * torch.log(torch.abs(x) + 1e-5)
+def symlog(x, scale=1.0):
+    return torch.sign(x) * torch.log1p((torch.abs(x) + 1e-5) / scale)
 
 
-def symexp(x):
-    return torch.sign(x) * (torch.exp(torch.clamp(torch.abs(x), max=20.0)) - 1)
+def symexp(x, scale=1.0):
+    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1) * scale
 
 
 def init_weights(m):
@@ -80,4 +80,4 @@ def log_rewards(writer, ep, score, avg_score, buffer_len, total_episodes):
     s_str = f"Score = {score:8.2f}"
     a_str = f"Avg.Score = {avg_score:8.2f}"
     b_str = f"Mem.Length = {buffer_len:07d}"
-    print(f"{e_str} {s_str}  {a_str}  {b_str}", end="\r")
+    print(f"{e_str}  {s_str}   {a_str}   {b_str}", end="\r")
