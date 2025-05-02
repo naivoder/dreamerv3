@@ -42,8 +42,8 @@ class Config:
         self.episodes = args.episodes
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.free_bits = 1.0
-        self.entropy_coef = 0.01
-        self.updates_per_step = 5
+        self.entropy_coef = 0.1
+        self.updates_per_step = 10
         self.grad_clip_world = 1000.0
         self.grad_clip_ac = 100.0
         self.mixed_precision = True
@@ -738,7 +738,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", type=str, default=None)
-    parser.add_argument("--episodes", type=int, default=10000)
+    parser.add_argument("--episodes", type=int, default=20000)
     args = parser.parse_args()
 
     for folder in ["metrics", "environments", "weights"]:
