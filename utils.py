@@ -57,6 +57,11 @@ def create_animation(env, agent, save_prefix, mod="best", seeds=10):
     env.close()
 
 
+def log_hparams(writer, config):
+    for key, value in vars(config).items():
+        writer.add_text(f"config/{key}", str(value), 0)
+
+
 def log_losses(writer, ep, losses):
     writer.add_scalar("Loss/World", losses["world_loss"], ep)
     writer.add_scalar("Loss/Recon", losses["recon_loss"], ep)
