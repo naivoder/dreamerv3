@@ -2,6 +2,7 @@ import numpy as np
 import torch
 from torch import nn
 import imageio
+import wandb
 
 
 def preprocess(image):
@@ -34,7 +35,7 @@ def save_animation(frames, filename):
 
 
 def create_animation(env, agent, save_prefix, mod="best", seeds=10):
-    agent.load_checkpoint(f"weights/{save_prefix}_{mod}_dreamerv3.pt")
+    agent.load_checkpoint(save_prefix, mod)
     best_total_reward, best_frames = float("-inf"), None
 
     for _ in range(seeds):
@@ -57,29 +58,52 @@ def create_animation(env, agent, save_prefix, mod="best", seeds=10):
     env.close()
 
 
-def log_hparams(writer, config):
-    for key, value in vars(config).items():
-        writer.add_text(f"config/{key}", str(value), 0)
+def log_hparams(writer, config, run_name: str, key_path: str):
+    # read and set API key
+    with open(key_path, "r", encoding="utf-8") as f:
+        os.environ["WANDB_API_KEY"] = f.read().strip()
+
+    # init run and save hyper‑parameters
+    wandb.init(
+        project="dreamerv3-atari", name=run_name, config=vars(config), reinit=True
+    )
 
 
-def log_losses(writer, ep, losses):
-    writer.add_scalar("Loss/World", losses["world_loss"], ep)
-    writer.add_scalar("Loss/Recon", losses["recon_loss"], ep)
-    writer.add_scalar("Loss/Reward", losses["reward_loss"], ep)
-    writer.add_scalar("Loss/Continue", losses["continue_loss"], ep)
-    writer.add_scalar("Loss/KL", losses["kl_loss"], ep)
-    writer.add_scalar("Loss/Actor", losses["actor_loss"], ep)
-    writer.add_scalar("Loss/Critic", losses["critic_loss"], ep)
-    writer.add_scalar("Entropy/Actor", losses["actor_entropy"], ep)
-    writer.add_scalar("Entropy/Prior", losses["prior_entropy"], ep)
-    writer.add_scalar("Entropy/Posterior", losses["posterior_entropy"], ep)
-    writer.add_scalar("Entropy/Reward", losses["reward_entropy"], ep)
+def log_losses(writer, ep: int, losses: dict):
+    wandb.log(
+        {
+            "Loss/World": losses["world_loss"],
+            "Loss/Recon": losses["recon_loss"],
+            "Loss/Reward": losses["reward_loss"],
+            "Loss/Continue": losses["continue_loss"],
+            "Loss/KL": losses["kl_loss"],
+            "Loss/Actor": losses["actor_loss"],
+            "Loss/Critic": losses["critic_loss"],
+            "Entropy/Actor": losses["actor_entropy"],
+            "Entropy/Prior": losses["prior_entropy"],
+            "Entropy/Posterior": losses["posterior_entropy"],
+            # "Entropy/Reward": losses["reward_entropy"],
+        },
+        step=ep,
+    )
 
 
-def log_rewards(writer, ep, score, avg_score, buffer_len, total_episodes):
-    writer.add_scalar("Reward/Score", score, ep)
-    writer.add_scalar("Reward/Average", avg_score, ep)
-    writer.add_scalar("Buffer/Length", buffer_len, ep)
+def log_rewards(
+    writer,
+    ep: int,
+    score: float,
+    avg_score: float,
+    buffer_len: int,
+    total_episodes: int,
+):
+    wandb.log(
+        {
+            "Reward/Score": score,
+            "Reward/Average": avg_score,
+            "Buffer/Length": buffer_len,
+        },
+        step=ep,
+    )
 
     e_str = f"[Ep {ep:05d}/{total_episodes}]"
     s_str = f"Score = {score:8.2f}"

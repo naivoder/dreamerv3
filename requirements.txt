@@ -9,3 +9,4 @@ imageio
 termcolor
 opencv-python 
 tensorboard
+wandb
