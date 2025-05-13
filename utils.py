@@ -3,6 +3,7 @@ import torch
 from torch import nn
 import imageio
 import wandb
+import os
 
 
 def preprocess(image):
@@ -13,12 +14,19 @@ def quantize(image):
     return (image * 255).clip(0, 255).astype(np.uint8)
 
 
-def symlog(x, scale=1.0):
-    return torch.sign(x) * torch.log1p((torch.abs(x) + 1e-5) / scale)
+def symlog(x):
+    return torch.sign(x) * torch.log(torch.abs(x) + 1e-5)
 
 
-def symexp(x, scale=1.0):
-    return torch.sign(x) * (torch.exp(torch.abs(x)) - 1) * scale
+def symexp(x):
+    return torch.sign(x) * (torch.exp(torch.clamp(torch.abs(x), max=20.0)) - 1)
+
+
+def init_weights(m):
+    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
+        nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
 
 
 def init_weights(m):
@@ -58,18 +66,17 @@ def create_animation(env, agent, save_prefix, mod="best", seeds=10):
     env.close()
 
 
-def log_hparams(writer, config, run_name: str, key_path: str):
-    # read and set API key
-    with open(key_path, "r", encoding="utf-8") as f:
+def log_hparams(config, run_name):
+    with open(config.wandb_key, "r", encoding="utf-8") as f:
         os.environ["WANDB_API_KEY"] = f.read().strip()
+    config.key_path = None
 
-    # init run and save hyper‑parameters
     wandb.init(
         project="dreamerv3-atari", name=run_name, config=vars(config), reinit=True
     )
 
 
-def log_losses(writer, ep: int, losses: dict):
+def log_losses(ep: int, losses: dict):
     wandb.log(
         {
             "Loss/World": losses["world_loss"],
@@ -89,7 +96,6 @@ def log_losses(writer, ep: int, losses: dict):
 
 
 def log_rewards(
-    writer,
     ep: int,
     score: float,
     avg_score: float,

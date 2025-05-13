@@ -6,6 +6,8 @@ environments/
 metrics/
 results/
 csv/
+runs/
+wandb/
 *.csv
 
 old.py

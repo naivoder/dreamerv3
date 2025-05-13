@@ -1,4 +1,5 @@
 import os
+import cv2
 import ale_py
 import gymnasium as gym
 import numpy as np
@@ -8,10 +9,9 @@ import torch.nn.functional as F
 import torch.optim as optim
 from datetime import datetime
 from torch.distributions import Categorical, Independent
-from torch.utils.tensorboard import SummaryWriter
+import warnings
 from environment import AtariEnv, ENV_LIST
 import utils
-import warnings
 
 warnings.simplefilter("ignore")
 gym.register_envs(ale_py)
@@ -20,14 +20,13 @@ torch.backends.cudnn.benchmark = True
 
 class Config:
     def __init__(self, args):
-        self.capacity = 2000000
+        self.capacity = 1_000_000
         self.batch_size = 16
         self.sequence_length = 64
         self.embed_dim = 1024
         self.latent_dim = 32
         self.num_classes = 32
         self.deter_dim = 4096
-        self.hidden_dim = 512
         self.lr = 4e-5
         self.eps = 1e-5
         self.actor_lr = 4e-5
@@ -35,21 +34,17 @@ class Config:
         self.discount = 0.99
         self.gae_lambda = 0.95
         self.kl_scale = 1.0
-        self.kl_balance = 0.8
-        self.symlog_scale = 2.0
         self.imagination_horizon = 15
-        self.min_buffer_size = 10000
-        self.episodes = args.episodes
+        self.min_buffer_size = 5000
+        self.episodes = 100_000
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.free_bits = 1.0
-        self.entropy_coef = 0.1
-        self.updates_per_step = 10
-        self.grad_clip_world = 1000.0
-        self.grad_clip_ac = 100.0
+        self.entropy_coef = 0.01
+        self.updates_per_step = 1
+        self.ac_grad_clip = 100.0
+        self.world_grad_clip = 1000.0
         self.mixed_precision = True
-
-    def to_dict(self):
-        return {k: str(v) for k, v in vars(self).items()}
+        self.wandb_key = args.wandb_key
 
 
 class ReplayBuffer:
@@ -57,14 +52,13 @@ class ReplayBuffer:
         self.capacity = config.capacity
         self.batch_size = config.batch_size
         self.sequence_length = config.sequence_length
-        self.symlog_scale = config.symlog_scale
         self.device = device
         self.obs_shape = obs_shape
 
         self.obs_buf = np.zeros((config.capacity, *obs_shape), dtype=np.uint8)
-        self.act_buf = np.zeros(config.capacity, dtype=np.int64)
+        self.act_buf = np.zeros(config.capacity, dtype=np.int16)
         self.rew_buf = np.zeros(config.capacity, dtype=np.float32)
-        self.done_buf = np.zeros(config.capacity, dtype=bool)
+        self.done_buf = np.zeros(config.capacity, dtype=np.bool_)
         self.pos = 0
         self.full = False
 
@@ -75,38 +69,35 @@ class ReplayBuffer:
         self.rew_buf[idx] = rew
         self.done_buf[idx] = done
         self.pos += 1
-
         if self.pos >= self.capacity:
             self.full = True
             self.pos = 0
 
     def sample(self):
-        size = self.capacity if self.full else self.pos
-        end = size - self.sequence_length
-        starts = np.random.randint(0, end, size=self.batch_size)
-        idxs = starts[:, None] + np.arange(self.sequence_length)
+        current_size = self.capacity if self.full else self.pos
+        valid_end = current_size - self.sequence_length
 
-        obs_batch = torch.as_tensor(
-            self.obs_buf[idxs], dtype=torch.float32, device=self.device
-        ).div_(255.0)
-        act_batch = torch.as_tensor(
-            self.act_buf[idxs], dtype=torch.long, device=self.device
+        start_indices = np.random.randint(0, valid_end, size=self.batch_size)
+        indices = (
+            start_indices[:, None] + np.arange(self.sequence_length)
+        ) % self.capacity
+
+        obs = torch.as_tensor(
+            self.obs_buf[indices], dtype=torch.float32, device=self.device
         )
-        rew_batch = utils.symlog(
-            torch.as_tensor(
-                self.rew_buf[idxs], dtype=torch.float32, device=self.device
-            ),
-            scale=self.symlog_scale,
-        )
-        done_batch = torch.as_tensor(
-            self.done_buf[idxs], dtype=torch.float32, device=self.device
-        )
+        obs = obs.div_(255.0).permute(1, 0, 2, 3, 4)
 
         return {
-            "observation": obs_batch,
-            "action": act_batch,
-            "reward": rew_batch,
-            "done": done_batch,
+            "observation": obs,
+            "action": torch.as_tensor(
+                self.act_buf[indices], dtype=torch.long, device=self.device
+            ).permute(1, 0),
+            "reward": torch.as_tensor(
+                self.rew_buf[indices], dtype=torch.float32, device=self.device
+            ).permute(1, 0),
+            "done": torch.as_tensor(
+                self.done_buf[indices], dtype=torch.float32, device=self.device
+            ).permute(1, 0),
         }
 
     def __len__(self):
@@ -119,51 +110,18 @@ class OneHotCategoricalStraightThrough(Categorical):
         return self.probs + (samples - self.probs).detach()
 
 
-class TwoHotCategoricalStraightThrough(torch.distributions.Distribution):
-    def __init__(self, logits, bins=255, low=-20.0, high=20.0):
-        super().__init__(validate_args=False)
-        self.logits = logits
-        self.bin_centers = torch.linspace(low, high, bins, device=logits.device)
-
-    def log_prob(self, value_log):
-        value_log = value_log.clamp(self.bin_centers[0], self.bin_centers[-1])
-
-        step = self.bin_centers[1] - self.bin_centers[0]
-        indices = (value_log - self.bin_centers[0]) / step
-
-        lo = indices.floor().clamp(0, len(self.bin_centers) - 1).long()
-        hi = indices.ceil().clamp(0, len(self.bin_centers) - 1).long()
-        alpha = (indices - lo).unsqueeze(-1)
-
-        probs = F.softmax(self.logits, dim=-1)
-        p_lo = probs.gather(-1, lo.unsqueeze(-1))
-        p_hi = probs.gather(-1, hi.unsqueeze(-1))
-
-        mix = (1.0 - alpha) * p_lo + alpha * p_hi
-        return mix.log().squeeze(-1)
-
-    @property
-    def mean(self):
-        return (F.softmax(self.logits, dim=-1) * self.bin_centers).sum(-1, keepdim=True)
-
-    def entropy(self):
-        probs = F.softmax(self.logits, dim=-1)
-        probs = probs.clamp(min=1e-12)
-        return -(probs * torch.log(probs)).sum(dim=-1)
-
-
 class ObservationEncoder(nn.Module):
     def __init__(self, in_channels, embed_dim):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels, 32, 4, 2),
-            nn.SiLU(),
+            nn.ReLU(),
             nn.Conv2d(32, 64, 4, 2),
-            nn.SiLU(),
+            nn.ReLU(),
             nn.Conv2d(64, 128, 4, 2),
-            nn.SiLU(),
+            nn.ReLU(),
             nn.Conv2d(128, 256, 4, 2),
-            nn.SiLU(),
+            nn.ReLU(),
             nn.Flatten(),
             nn.Linear(256 * 2 * 2, embed_dim),
             nn.LayerNorm(embed_dim),
@@ -192,13 +150,41 @@ class ObservationDecoder(nn.Module):
             nn.ConvTranspose2d(64, 32, 4, 2, 1),
             nn.SiLU(),
             nn.Conv2d(32, out_channels, 3, padding=1),
-            nn.Sigmoid(),  # bound [0,1]
+            nn.Sigmoid(),
         )
         self.apply(utils.init_weights)
 
     def forward(self, x):
         x = self.net(x)
         return x
+
+
+class TwoHotCategoricalStraightThrough(torch.distributions.Distribution):
+    def __init__(self, logits, bins=255, low=-20.0, high=20.0):
+        super().__init__(validate_args=False)
+        self.logits = logits
+        self.bin_centers = torch.linspace(low, high, bins, device=logits.device)
+
+    def log_prob(self, value):
+        value = utils.symlog(value).clamp(self.bin_centers[0], self.bin_centers[-1])
+        indices = (
+            (value - self.bin_centers[0]) / (self.bin_centers[1] - self.bin_centers[0])
+        ).clamp(0, len(self.bin_centers) - 1)
+
+        lower = indices.floor().long().unsqueeze(-1)
+        upper = indices.ceil().long().unsqueeze(-1)
+        alpha = (indices - lower.squeeze(-1)).unsqueeze(-1)
+
+        probs = F.softmax(self.logits, dim=-1)
+        return torch.log(
+            (1 - alpha) * probs.gather(-1, lower) + alpha * probs.gather(-1, upper)
+        ).squeeze(-1)
+
+    @property
+    def mean(self):
+        return utils.symexp(
+            (F.softmax(self.logits, dim=-1) * self.bin_centers).sum(-1, keepdim=True)
+        )
 
 
 class RSSM(nn.Module):
@@ -215,7 +201,6 @@ class RSSM(nn.Module):
             nn.LayerNorm(512),
             nn.SiLU(),
             nn.Linear(512, latent_dim * num_classes),
-            nn.LayerNorm(latent_dim * num_classes),
         )
 
         self.post_net = nn.Sequential(
@@ -223,7 +208,6 @@ class RSSM(nn.Module):
             nn.LayerNorm(512),
             nn.SiLU(),
             nn.Linear(512, latent_dim * num_classes),
-            nn.LayerNorm(latent_dim * num_classes),
         )
 
         self.gru = nn.GRUCell(latent_dim * num_classes + action_dim, deter_dim)
@@ -232,24 +216,28 @@ class RSSM(nn.Module):
         self.apply(utils.init_weights)
 
     def init_state(self, batch_size, device):
-        stoch = F.gumbel_softmax(
-            self.stoch_init.repeat(batch_size, 1, 1), tau=1.0, hard=True
+        stoch = (
+            F.one_hot(
+                torch.zeros(batch_size, self.latent_dim, dtype=torch.long),
+                self.num_classes,
+            )
+            .float()
+            .to(device)
         )
         deter = self.deter_init.repeat(batch_size, 1)
         return (stoch, deter)
 
     def imagine_step(self, stoch, deter, action):
-        # sample from prior
+        # Use prior network
         action_oh = F.one_hot(action, self.action_dim).float()
         gru_input = torch.cat([stoch.flatten(1), action_oh], dim=1)
         deter = self.gru(gru_input, deter)
-
         prior_logits = self.prior_net(deter).view(-1, self.latent_dim, self.num_classes)
         stoch = F.gumbel_softmax(prior_logits, tau=1.0, hard=True)
         return stoch, deter
 
     def observe_step(self, deter, embed):
-        # sample from posterior
+        # Use posterior network
         post_logits = self.post_net(torch.cat([deter, embed], dim=1))
         post_logits = post_logits.view(-1, self.latent_dim, self.num_classes)
         return post_logits
@@ -299,39 +287,30 @@ class RSSM(nn.Module):
 class WorldModel(nn.Module):
     def __init__(
         self,
-        obs_size,
+        in_channels,
         action_dim,
-        config,
+        embed_dim,
+        latent_dim,
+        num_classes,
+        deter_dim,
+        obs_size,
     ):
         super().__init__()
-        in_channels = obs_size[0]
-        embed_dim = config.embed_dim
-        deter_dim = config.deter_dim
-        latent_dim = config.latent_dim
-        num_classes = config.num_classes
-        self.mixed_precision = config.mixed_precision
         self.encoder = ObservationEncoder(in_channels, embed_dim)
         self.rssm = RSSM(action_dim, latent_dim, num_classes, deter_dim, embed_dim)
         self.decoder = ObservationDecoder(
             deter_dim + latent_dim * num_classes, in_channels, obs_size[1:]
         )
         self.reward_decoder = nn.Sequential(
-            nn.Linear(deter_dim + latent_dim * num_classes, 512),
-            nn.LayerNorm(512),
-            nn.SiLU(),
-            nn.Linear(512, 255),
-            nn.LayerNorm(255),
+            nn.Linear(deter_dim + latent_dim * num_classes, 255)
         )
-
         self.continue_decoder = nn.Sequential(
-            nn.Linear(deter_dim + latent_dim * num_classes, 512),
-            nn.LayerNorm(512),
-            nn.SiLU(),
-            nn.Linear(512, 1),
+            nn.Linear(deter_dim + latent_dim * num_classes, 1), nn.Sigmoid()
         )
+        self.apply(utils.init_weights)
 
     def observe(self, observations, actions):
-        with torch.amp.autocast("cuda", enabled=self.mixed_precision):
+        with torch.amp.autocast("cuda"):
             embed = self.encoder(observations.flatten(0, 1)).view(
                 actions.size(0), actions.size(1), -1
             )
@@ -410,9 +389,12 @@ class Critic(nn.Module):
             nn.Linear(512, 512),
             nn.LayerNorm(512),
             nn.SiLU(),
-            nn.Linear(512, 1),
+            nn.Linear(512, 255),  # Output logits for 255 bins
         )
         self.apply(utils.init_weights)
+        # Initialize last layer to zeros as per the paper
+        self.net[-1].weight.data.zero_()
+        self.net[-1].bias.data.zero_()
 
     def forward(self, x):
         return self.net(x)
@@ -426,7 +408,15 @@ class DreamerV3:
         self.replay_buffer = ReplayBuffer(config, config.device, obs_shape)
         self.device = config.device
 
-        self.world_model = WorldModel(obs_shape, action_dim, config).to(self.device)
+        self.world_model = WorldModel(
+            obs_shape[0],
+            action_dim,
+            config.embed_dim,
+            config.latent_dim,
+            config.num_classes,
+            config.deter_dim,
+            obs_shape,
+        ).to(self.device)
 
         feature_dim = config.deter_dim + config.latent_dim * config.num_classes
         self.actor = Actor(feature_dim, action_dim).to(self.device)
@@ -442,6 +432,7 @@ class DreamerV3:
         self.scalers = {k: torch.amp.GradScaler("CUDA") for k in self.optimizers}
 
         self.hidden_state = None
+        self.step = 0
 
     def init_hidden_state(self):
         self.hidden_state = self.world_model.rssm.init_state(1, self.device)
@@ -457,183 +448,199 @@ class DreamerV3:
             stoch, deter = self.hidden_state
             embed = self.world_model.encoder(obs)
 
-            # sample posterior
+            # Get posterior
             post_logits = self.world_model.rssm.observe_step(deter, embed)
             post_logits = post_logits.view(
                 1, self.config.latent_dim, self.config.num_classes
             )
             stoch = F.gumbel_softmax(post_logits, tau=1.0, hard=True)
 
-            # choose action
+            # Get action
             feature = torch.cat([deter, stoch.flatten(1)], dim=1)
             action = self.actor(feature).sample()
 
-            # update hidden state
+            # Update hidden state
             _, deter = self.world_model.rssm.imagine_step(stoch, deter, action)
             self.hidden_state = (stoch, deter)
 
         return int(action.item())
 
     def store_transition(self, obs, action, reward, done):
-        if not obs.dtype == torch.uint8:
-            obs = utils.quantize(obs)
-        self.replay_buffer.store(obs, action, reward, done)
+        self.replay_buffer.store(utils.quantize(obs), action, reward, done)
 
-    def _world_loss(self, obs, act, rew, done):
-        (priors, posts), features, _, reward_dist, cont_pred = self.world_model.observe(
-            obs, act
-        )
+    def update_world_model(self, batch):
+        self.optimizers["world"].zero_grad()
 
-        prior_entropy = torch.stack([p.entropy() for p in priors]).mean()
-        post_entropy = torch.stack([q.entropy() for q in posts]).mean()
+        with torch.amp.autocast("cuda"):
+            (priors, posteriors), features, recon_dist, reward_dist, continue_pred = (
+                self.world_model.observe(batch["observation"], batch["action"])
+            )
 
-        feats_TBD = features.permute(1, 0, 2)
-        flat_feat = feats_TBD.flatten(0, 1)
+            prior_entropy = torch.stack([p.entropy() for p in priors]).mean()
+            post_entropy = torch.stack([q.entropy() for q in posteriors]).mean()
 
-        obs_TB = obs.permute(1, 0, *range(2, obs.ndim))
-        recon_pred = self.world_model.decoder(flat_feat)
-        recon_target = obs_TB.flatten(0, 1)
-        if obs.dtype == torch.uint8:
-            recon_target = recon_target.float() / 255.0
-        recon_loss = F.mse_loss(recon_pred, recon_target, reduction="mean")
+            # Calculate losses
+            # recon_loss = -recon_dist.log_prob(
+            #     (batch["observation"] * 255).long().flatten(0, 1)
+            # ).mean()
 
-        rew_TB = rew.permute(1, 0).flatten(0, 1)
-        reward_loss = -reward_dist.log_prob(rew_TB).mean()
-        reward_entropy = reward_dist.entropy().mean()
+            flat_feat = features.permute(1, 0, 2).flatten(0, 1)
+            obs = batch["observation"]
+            recon_target = obs.permute(1, 0, *range(2, obs.ndim)).flatten(0, 1)
+            recon_pred = self.world_model.decoder(flat_feat)
+            if obs.dtype == torch.uint8:
+                recon_target = recon_target.float() / 255.0
+            recon_loss = F.mse_loss(recon_pred, recon_target, reduction="mean")
 
-        cont_TB = cont_pred.flatten(0, 1)
-        cont_target = (1 - done).permute(1, 0).flatten(0, 1)
-        cont_loss = F.binary_cross_entropy_with_logits(cont_TB, cont_target)
+            reward_loss = -reward_dist.log_prob(batch["reward"].flatten(0, 1)).mean()
+            continue_loss = F.binary_cross_entropy_with_logits(
+                continue_pred.flatten(0, 1), (1 - batch["done"].flatten(0, 1))
+            )
 
-        kl = torch.stack(
-            [torch.distributions.kl_divergence(q, p) for p, q in zip(priors, posts)]
-        )
-        kl = kl.mean(0)  # average over time steps
-        kl = torch.clamp_min(kl, self.config.free_bits / kl.shape[-1])
-        kl = self.config.kl_balance * kl + (1 - self.config.kl_balance) * kl.detach()
-        kl = kl.sum(-1)  # sum over latent dimensions
-        kl_loss = kl.mean()
+            # KL loss with free bits
+            kl_loss = 0
+            for prior, posterior in zip(priors, posteriors):
+                kl_t = torch.distributions.kl_divergence(posterior, prior)
+                kl_t = torch.mean(kl_t, dim=0)  # Average over batch, keep latents
+                kl_t = torch.sum(torch.clamp(kl_t, min=self.config.free_bits))
+                kl_loss += kl_t
+            kl_loss /= len(priors)
 
-        total = recon_loss + reward_loss + cont_loss + self.config.kl_scale * kl_loss
+            total_loss = (
+                recon_loss
+                + reward_loss
+                + continue_loss
+                + self.config.kl_scale * kl_loss
+            )
 
-        return (
-            total,
-            recon_loss,
-            reward_loss,
-            cont_loss,
-            kl_loss,
-            reward_entropy,
-            prior_entropy,
-            post_entropy,
-        )
-
-    def update_world_model(self):
-        if len(self.replay_buffer) < self.config.min_buffer_size:
-            return None
-
-        opt = self.optimizers["world"]
-        scaler = self.scalers["world"]
-        opt.zero_grad()
-
-        batch = self.replay_buffer.sample()
-        obs = batch["observation"].to(self.device)
-        act = batch["action"].to(self.device)
-        rew = batch["reward"].to(self.device)
-        done = batch["done"].to(self.device)
-
-        with torch.amp.autocast("cuda", enabled=self.config.mixed_precision):
-            total, r, rr, c, k, re, pre, poe = self._world_loss(obs, act, rew, done)
-
-        scaler.scale(total).backward()
+        self.scalers["world"].scale(total_loss).backward()
         torch.nn.utils.clip_grad_norm_(
-            self.world_model.parameters(), self.config.grad_clip_world
+            self.world_model.parameters(), self.config.world_grad_clip
         )
-        scaler.step(opt)
-        scaler.update()
+        self.scalers["world"].step(self.optimizers["world"])
+        self.scalers["world"].update()
 
         return {
-            "world_loss": total.item(),
-            "recon_loss": r.item(),
-            "reward_loss": rr.item(),
-            "continue_loss": c.item(),
-            "kl_loss": k.item(),
-            "reward_entropy": re.item(),
-            "prior_entropy": pre.item(),
-            "posterior_entropy": poe.item(),
+            "world_loss": total_loss.item(),
+            "recon_loss": recon_loss.item(),
+            "reward_loss": reward_loss.item(),
+            "continue_loss": continue_loss.item(),
+            "kl_loss": kl_loss.item(),
+            "prior_entropy": prior_entropy.item(),
+            "posterior_entropy": post_entropy.item(),
         }
 
     def update_actor_and_critic(self):
-        # imagination rollout
+        B = self.config.batch_size
+        init_state = self.world_model.rssm.init_state(B, self.device)
+
+        # Imagined trajectories
         with torch.no_grad(), torch.amp.autocast("cuda"):
-            init_state = self.world_model.rssm.init_state(
-                self.config.batch_size, self.device
-            )
-            feats, acts = self.world_model.rssm.imagine(
+            features, actions = self.world_model.rssm.imagine(
                 init_state, self.actor, self.config.imagination_horizon
             )
-            rd = self.world_model.reward_decoder(feats.flatten(0, 1))
-            cd = self.world_model.continue_decoder(feats.flatten(0, 1))
-            rewards = utils.symexp(
-                TwoHotCategoricalStraightThrough(rd).mean.view_as(acts),
-                self.config.symlog_scale,
+
+            # Predict rewards and continues
+            reward_dist = TwoHotCategoricalStraightThrough(
+                self.world_model.reward_decoder(features.flatten(0, 1))
             )
-            continues = torch.sigmoid(cd.view_as(acts)) * (
-                1 - 1 / self.config.imagination_horizon
-            )
+            continue_pred = self.world_model.continue_decoder(features.flatten(0, 1))
+
+            rewards = reward_dist.mean.view_as(actions)
+            continues = continue_pred.view_as(actions)
             discounts = self.config.discount * continues
 
-        flat = feats.reshape(-1, feats.shape[-1])
+        # Critic update
+        T, B, feat_dim = features.shape
+        features_flat = features.reshape(-1, feat_dim)
 
-        # critic update
-        opt_c = self.optimizers["critic"]
-        scaler_c = self.scalers["critic"]
-        opt_c.zero_grad()
-
-        with torch.amp.autocast("cuda", enabled=self.config.mixed_precision):
-            values = self.critic(flat).reshape_as(acts)
-            last_value = values[-1]
-            next_vals = torch.cat([values[1:], last_value.unsqueeze(0)], dim=0)
-            deltas = rewards + discounts * next_vals - values
-            weights = discounts * self.config.gae_lambda
-            rev_deltas = deltas.flip(0)
-            rev_weights = weights.flip(0)
-            rev_prod = torch.cumprod(
-                torch.cat([torch.ones_like(rev_weights[:1]), rev_weights[:-1]], 0),
-                dim=0,
+        self.optimizers["critic"].zero_grad()
+        with torch.amp.autocast("cuda"):
+            logits_imagined = self.critic(features_flat).view(T, B, 255)
+            bin_centers = torch.linspace(
+                -20.0, 20.0, 255, device=logits_imagined.device
             )
-            rev_adv = torch.cumsum(rev_deltas * rev_prod, dim=0)
-            advantages = rev_adv.flip(0)
-            returns = utils.symlog(advantages + rewards)
-            critic_loss = F.mse_loss(values, returns.detach())
+            probs_imagined = F.softmax(logits_imagined, dim=-1)
+            values_imagined = (probs_imagined * bin_centers).sum(-1)
 
-        scaler_c.scale(critic_loss).backward()
-        torch.nn.utils.clip_grad_norm_(
-            self.critic.parameters(), self.config.grad_clip_ac
-        )
-        scaler_c.step(opt_c)
-        scaler_c.update()
+            # Compute λ-returns for imagined trajectories
+            lambda_ = self.config.gae_lambda
+            returns_imagined = torch.zeros_like(values_imagined)
+            returns_imagined[-1] = values_imagined[-1]
+            for t in reversed(range(T - 1)):
+                blended = (1 - lambda_) * values_imagined[
+                    t
+                ] + lambda_ * returns_imagined[t + 1]
+                returns_imagined[t] = rewards[t] + discounts[t] * blended
 
-        # actor update
-        opt_a = self.optimizers["actor"]
-        scaler_a = self.scalers["actor"]
-        opt_a.zero_grad()
-
-        with torch.amp.autocast("cuda", enabled=self.config.mixed_precision):
-            dist = self.actor(flat)
-            logp = dist.log_prob(acts.reshape(-1))
-            adv_flat = advantages.detach().reshape(-1)
-            adv_norm = (adv_flat - adv_flat.mean()) / (
-                adv_flat.std(unbiased=False) + 1e-8
+            returns_imagined_flat = returns_imagined.flatten(0, 1)
+            logits_imagined_flat = logits_imagined.flatten(0, 1)
+            critic_dist_imagined = TwoHotCategoricalStraightThrough(
+                logits_imagined_flat
             )
-            entropy = dist.entropy().mean()
-            actor_loss = -(logp * adv_norm).mean() - self.config.entropy_coef * entropy
+            loss_imagined = -critic_dist_imagined.log_prob(returns_imagined_flat).mean()
 
-        scaler_a.scale(actor_loss).backward()
+            batch = self.replay_buffer.sample()
+            (_, _, _, _, continue_pred_replay), features_replay = (
+                self.world_model.observe(batch["observation"], batch["action"])
+            )
+            features_replay_flat = features_replay.permute(1, 0, 2).flatten(0, 1)
+            logits_replay = self.critic(features_replay_flat).view(-1, 255)
+
+            # Compute λ-returns for replay using actual buffer rewards
+            rewards_replay = batch["reward"].squeeze(-1)  # (T, B)
+            continues_replay = 1 - batch["done"].squeeze(-1)
+            discounts_replay = self.config.discount * continues_replay
+
+            with torch.no_grad():
+                values_replay = (
+                    (F.softmax(logits_replay, dim=-1) * bin_centers).sum(-1).view(T, B)
+                )
+                returns_replay = torch.zeros_like(values_replay)
+                returns_replay[-1] = values_replay[-1]
+                for t in reversed(range(T - 1)):
+                    blended = (1 - lambda_) * values_replay[
+                        t
+                    ] + lambda_ * returns_replay[t + 1]
+                    returns_replay[t] = (
+                        rewards_replay[t] + discounts_replay[t] * blended
+                    )
+
+            # Loss for replay trajectories (weighted by 0.3)
+            returns_replay_flat = returns_replay.flatten(0, 1)
+            logits_replay_flat = logits_replay.flatten(0, 1)
+            critic_dist_replay = TwoHotCategoricalStraightThrough(logits_replay_flat)
+            loss_replay = -critic_dist_replay.log_prob(returns_replay_flat).mean()
+
+            # Total critic loss
+            critic_loss = loss_imagined + 0.3 * loss_replay
+
+        self.scalers["critic"].scale(critic_loss).backward()
         torch.nn.utils.clip_grad_norm_(
-            self.actor.parameters(), self.config.grad_clip_ac
+            self.critic.parameters(), self.config.ac_grad_clip
         )
-        scaler_a.step(opt_a)
-        scaler_a.update()
+        self.scalers["critic"].step(self.optimizers["critic"])
+        self.scalers["critic"].update()
+
+        # Actor update
+        self.optimizers["actor"].zero_grad()
+        with torch.amp.autocast("cuda"):
+            advantages = returns_imagined - values_imagined
+            action_dist = self.actor(features_flat)
+            log_probs = action_dist.log_prob(actions.reshape(-1))
+            entropy = action_dist.entropy().mean()
+
+            actor_loss = (
+                -(log_probs * advantages.reshape(-1).detach()).mean()
+                - self.config.entropy_coef * entropy
+            )
+
+        self.scalers["actor"].scale(actor_loss).backward()
+        torch.nn.utils.clip_grad_norm_(
+            self.actor.parameters(), self.config.ac_grad_clip
+        )
+        self.scalers["actor"].step(self.optimizers["actor"])
+        self.scalers["actor"].update()
 
         return {
             "actor_loss": actor_loss.item(),
@@ -645,10 +652,34 @@ class DreamerV3:
         if len(self.replay_buffer) < self.config.min_buffer_size:
             return None
 
-        wm_losses = self.update_world_model()
-        ac_losses = self.update_actor_and_critic()
+        losses = {
+            "world_loss": 0,
+            "recon_loss": 0,
+            "reward_loss": 0,
+            "continue_loss": 0,
+            "kl_loss": 0,
+            "actor_loss": 0,
+            "critic_loss": 0,
+            "actor_entropy": 0,
+            "prior_entropy": 0,
+            "posterior_entropy": 0,
+        }
 
-        return {**wm_losses, **ac_losses}
+        for _ in range(self.config.updates_per_step):
+            batch = self.replay_buffer.sample()
+
+            # World model update
+            wm_losses = self.update_world_model(batch)
+            for k, v in wm_losses.items():
+                losses[k] += v / self.config.updates_per_step
+
+            # Actor-critic update
+            ac_losses = self.update_actor_and_critic()
+            for k, v in ac_losses.items():
+                losses[k] += v / self.config.updates_per_step
+
+        self.step += 1
+        return losses
 
     def save_checkpoint(self, env_name):
         os.makedirs("weights", exist_ok=True)
@@ -669,19 +700,19 @@ class DreamerV3:
 
 
 def train_dreamer(args):
+    config = Config(args)
+
     env = AtariEnv(args.env).make()
     obs_shape = env.observation_space.shape
     act_dim = env.action_space.n
-    save_prefix = args.env.split("/")[-1]
+    save_prefix = args.env.split("/")[-1].split("NoFrameskip")[0]
     print(f"Env: {save_prefix}, Obs: {obs_shape}, Act: {act_dim}")
 
-    config = Config(args)
     agent = DreamerV3(obs_shape, act_dim, config)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    writer = SummaryWriter(log_dir=f"metrics/{save_prefix}_{timestamp}")
-
-    writer.add_hparams(config.to_dict(), {})
+    run_name = f"{save_prefix}_{timestamp}"
+    utils.log_hparams(config, run_name)
 
     episode_history = []
     avg_reward_window = 100
@@ -703,13 +734,12 @@ def train_dreamer(args):
             ep = len(episode_history)
 
             if len(agent.replay_buffer) >= config.min_buffer_size:
-                for _ in range(config.updates_per_step):
-                    losses = agent.train()
-                utils.log_losses(writer, ep, losses)
+                losses = agent.train()
+                utils.log_losses(ep, losses)
 
             avg_score = np.mean(episode_history[-avg_reward_window:])
             buffer_len = len(agent.replay_buffer)
-            utils.log_rewards(writer, ep, score, avg_score, buffer_len, config.episodes)
+            utils.log_rewards(ep, score, avg_score, buffer_len, config.episodes)
 
             if score >= max(episode_history, default=-np.inf):
                 agent.save_checkpoint(save_prefix + "_best")
@@ -726,7 +756,6 @@ def train_dreamer(args):
 
     print(f"\nFinished training. Final Avg.Score = {avg_score:.2f}")
     agent.save_checkpoint(save_prefix + "_final")
-    writer.close()
     env.close()
 
     env = AtariEnv(args.env, shape=(64, 64), repeat=4, clip_rewards=False).make()
@@ -738,12 +767,10 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", type=str, default=None)
-    parser.add_argument("--episodes", type=int, default=20000)
+    parser.add_argument("--wandb_key", type=str, default="../wandb.txt")
     args = parser.parse_args()
-
-    for folder in ["metrics", "environments", "weights"]:
+    for folder in ["environments", "weights"]:
         os.makedirs(folder, exist_ok=True)
-
     if args.env:
         train_dreamer(args)
     else:
