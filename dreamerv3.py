@@ -39,7 +39,7 @@ class Config:
         self.episodes = 100_000
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.free_bits = 1.0
-        self.entropy_coef = 3e-4
+        self.entropy_coef = 0.01
         self.retnorm_scale = 1.0
         self.retnorm_limit = 1.0
         self.retnorm_decay = 0.99
@@ -489,11 +489,6 @@ class DreamerV3:
             prior_entropy = torch.stack([p.entropy() for p in priors]).mean()
             post_entropy = torch.stack([q.entropy() for q in posteriors]).mean()
 
-            # Calculate losses
-            # recon_loss = -recon_dist.log_prob(
-            #     (batch["observation"] * 255).long().flatten(0, 1)
-            # ).mean()
-
             flat_feat = features.permute(1, 0, 2).flatten(0, 1)
             obs = batch["observation"]
             recon_target = obs.permute(1, 0, *range(2, obs.ndim)).flatten(0, 1)
@@ -591,24 +586,29 @@ class DreamerV3:
         # Actor update
         self.optimizers["actor"].zero_grad()
         with torch.amp.autocast("cuda"):
-            # Normalize returns
             returns = returns.detach()
-            scale = torch.quantile(returns, 0.95) - torch.quantile(returns, 0.05)
-            scale = torch.clamp(scale, min=self.config.retnorm_limit)
+            current_scale = (
+                torch.quantile(returns, 0.95) - torch.quantile(returns, 0.05)
+            ).clamp(min=self.config.retnorm_limit)
+
+            # Update EMA scale
             self.config.retnorm_scale = (
                 self.config.retnorm_decay * self.config.retnorm_scale
-                + (1 - self.config.retnorm_decay) * scale.item()
+                + (1 - self.config.retnorm_decay) * current_scale.item()
             )
+
+            # Normalize returns
             returns = returns / max(1.0, self.config.retnorm_scale)
 
-            # Actor loss with normalized returns
+            # Advantages with whitening
             advantages = returns - values.detach()
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-5)
+
             action_dist = self.actor(features_flat)
             log_probs = action_dist.log_prob(actions.reshape(-1))
             entropy = action_dist.entropy().mean()
             actor_loss = (
-                -(log_probs * advantages.reshape(-1).detach()).mean()
+                -(log_probs * advantages.reshape(-1)).mean()
                 - self.config.entropy_coef * entropy
             )
 
