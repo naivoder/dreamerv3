@@ -17,6 +17,8 @@ warnings.simplefilter("ignore")
 gym.register_envs(ale_py)
 torch.backends.cudnn.benchmark = True
 
+# may want to revert to simple critic update rather than blended...
+
 
 class Config:
     def __init__(self, args):
@@ -29,8 +31,8 @@ class Config:
         self.deter_dim = 4096
         self.lr = 4e-5
         self.eps = 1e-5
-        self.actor_lr = 4e-5
-        self.critic_lr = 4e-5
+        self.actor_lr = 3e-4
+        self.critic_lr = 3e-4
         self.discount = 0.99
         self.gae_lambda = 0.95
         self.kl_scale = 1.0
@@ -534,7 +536,6 @@ class DreamerV3:
         B = self.config.batch_size
         init_state = self.world_model.rssm.init_state(B, self.device)
 
-        # Imagined trajectories
         with torch.no_grad(), torch.amp.autocast("cuda"):
             features, actions = self.world_model.rssm.imagine(
                 init_state, self.actor, self.config.imagination_horizon
@@ -550,70 +551,27 @@ class DreamerV3:
             continues = continue_pred.view_as(actions)
             discounts = self.config.discount * continues
 
-        # Critic update
         T, B, feat_dim = features.shape
         features_flat = features.reshape(-1, feat_dim)
 
+        # Critic update
         self.optimizers["critic"].zero_grad()
         with torch.amp.autocast("cuda"):
-            logits_imagined = self.critic(features_flat).view(T, B, 255)
-            bin_centers = torch.linspace(
-                -20.0, 20.0, 255, device=logits_imagined.device
-            )
-            probs_imagined = F.softmax(logits_imagined, dim=-1)
-            values_imagined = (probs_imagined * bin_centers).sum(-1)
+            logits = self.critic(features_flat).view(T, B, 255)
+            bin_centers = torch.linspace(-20.0, 20.0, 255, device=logits.device)
+            probs = F.softmax(logits, dim=-1)
+            values = (probs * bin_centers).sum(-1)  # (T, B)
 
-            # Compute λ-returns for imagined trajectories
+            # Compute λ-returns (λ=0.95)
             lambda_ = self.config.gae_lambda
-            returns_imagined = torch.zeros_like(values_imagined)
-            returns_imagined[-1] = values_imagined[-1]
+            returns = torch.zeros_like(values)
+            returns[-1] = values[-1]
             for t in reversed(range(T - 1)):
-                blended = (1 - lambda_) * values_imagined[
-                    t
-                ] + lambda_ * returns_imagined[t + 1]
-                returns_imagined[t] = rewards[t] + discounts[t] * blended
+                blended = (1 - lambda_) * values[t] + lambda_ * returns[t + 1]
+                returns[t] = rewards[t] + discounts[t] * blended
 
-            returns_imagined_flat = returns_imagined.flatten(0, 1)
-            logits_imagined_flat = logits_imagined.flatten(0, 1)
-            critic_dist_imagined = TwoHotCategoricalStraightThrough(
-                logits_imagined_flat
-            )
-            loss_imagined = -critic_dist_imagined.log_prob(returns_imagined_flat).mean()
-
-            batch = self.replay_buffer.sample()
-            (_, _, _, _, continue_pred_replay), features_replay = (
-                self.world_model.observe(batch["observation"], batch["action"])
-            )
-            features_replay_flat = features_replay.permute(1, 0, 2).flatten(0, 1)
-            logits_replay = self.critic(features_replay_flat).view(-1, 255)
-
-            # Compute λ-returns for replay using actual buffer rewards
-            rewards_replay = batch["reward"].squeeze(-1)  # (T, B)
-            continues_replay = 1 - batch["done"].squeeze(-1)
-            discounts_replay = self.config.discount * continues_replay
-
-            with torch.no_grad():
-                values_replay = (
-                    (F.softmax(logits_replay, dim=-1) * bin_centers).sum(-1).view(T, B)
-                )
-                returns_replay = torch.zeros_like(values_replay)
-                returns_replay[-1] = values_replay[-1]
-                for t in reversed(range(T - 1)):
-                    blended = (1 - lambda_) * values_replay[
-                        t
-                    ] + lambda_ * returns_replay[t + 1]
-                    returns_replay[t] = (
-                        rewards_replay[t] + discounts_replay[t] * blended
-                    )
-
-            # Loss for replay trajectories (weighted by 0.3)
-            returns_replay_flat = returns_replay.flatten(0, 1)
-            logits_replay_flat = logits_replay.flatten(0, 1)
-            critic_dist_replay = TwoHotCategoricalStraightThrough(logits_replay_flat)
-            loss_replay = -critic_dist_replay.log_prob(returns_replay_flat).mean()
-
-            # Total critic loss
-            critic_loss = loss_imagined + 0.3 * loss_replay
+            critic_dist = TwoHotCategoricalStraightThrough(logits.flatten(0, 1))
+            critic_loss = -critic_dist.log_prob(returns.flatten(0, 1)).mean()
 
         self.scalers["critic"].scale(critic_loss).backward()
         torch.nn.utils.clip_grad_norm_(
@@ -625,7 +583,7 @@ class DreamerV3:
         # Actor update
         self.optimizers["actor"].zero_grad()
         with torch.amp.autocast("cuda"):
-            advantages = returns_imagined - values_imagined
+            advantages = returns - values
             action_dist = self.actor(features_flat)
             log_probs = action_dist.log_prob(actions.reshape(-1))
             entropy = action_dist.entropy().mean()
