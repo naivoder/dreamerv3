@@ -17,8 +17,6 @@ warnings.simplefilter("ignore")
 gym.register_envs(ale_py)
 torch.backends.cudnn.benchmark = True
 
-# may want to revert to simple critic update rather than blended...
-
 
 class Config:
     def __init__(self, args):
@@ -31,8 +29,8 @@ class Config:
         self.deter_dim = 4096
         self.lr = 4e-5
         self.eps = 1e-5
-        self.actor_lr = 3e-4
-        self.critic_lr = 3e-4
+        self.actor_lr = 4e-5
+        self.critic_lr = 4e-5
         self.discount = 0.99
         self.gae_lambda = 0.95
         self.kl_scale = 1.0
@@ -41,7 +39,10 @@ class Config:
         self.episodes = 100_000
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.free_bits = 1.0
-        self.entropy_coef = 0.01
+        self.entropy_coef = 3e-4
+        self.retnorm_scale = 1.0
+        self.retnorm_limit = 1.0
+        self.retnorm_decay = 0.99
         self.updates_per_step = 1
         self.ac_grad_clip = 100.0
         self.world_grad_clip = 1000.0
@@ -309,6 +310,11 @@ class WorldModel(nn.Module):
         self.continue_decoder = nn.Sequential(
             nn.Linear(deter_dim + latent_dim * num_classes, 1), nn.Sigmoid()
         )
+
+        self.reward_decoder[-1].weight.data.zero_()
+        self.reward_decoder[-1].bias.data.zero_()
+        self.continue_decoder[-2].weight.data.zero_()
+        self.continue_decoder[-2].bias.data.zero_()
         self.apply(utils.init_weights)
 
     def observe(self, observations, actions):
@@ -373,6 +379,8 @@ class Actor(nn.Module):
             nn.Linear(512, action_dim),
         )
         self.apply(utils.init_weights)
+        self.net[-1].weight.data.zero_()
+        self.net[-1].bias.data.zero_()
 
     def forward(self, x):
         return Categorical(logits=self.net(x))
@@ -583,11 +591,22 @@ class DreamerV3:
         # Actor update
         self.optimizers["actor"].zero_grad()
         with torch.amp.autocast("cuda"):
-            advantages = returns - values
+            # Normalize returns
+            returns = returns.detach()
+            scale = torch.quantile(returns, 0.95) - torch.quantile(returns, 0.05)
+            scale = torch.clamp(scale, min=self.config.retnorm_limit)
+            self.config.retnorm_scale = (
+                self.config.retnorm_decay * self.config.retnorm_scale
+                + (1 - self.config.retnorm_decay) * scale.item()
+            )
+            returns = returns / max(1.0, self.config.retnorm_scale)
+
+            # Actor loss with normalized returns
+            advantages = returns - values.detach()
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-5)
             action_dist = self.actor(features_flat)
             log_probs = action_dist.log_prob(actions.reshape(-1))
             entropy = action_dist.entropy().mean()
-
             actor_loss = (
                 -(log_probs * advantages.reshape(-1).detach()).mean()
                 - self.config.entropy_coef * entropy
