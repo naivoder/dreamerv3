@@ -33,13 +33,13 @@ class Config:
         self.critic_lr = 4e-5
         self.discount = 0.99
         self.gae_lambda = 0.95
-        self.kl_scale = 1.0
+        self.rep_loss_scale = 0.1
         self.imagination_horizon = 15
         self.min_buffer_size = 5000
         self.episodes = 100_000
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.free_bits = 1.0
-        self.entropy_coef = 0.01
+        self.entropy_coef = 0.1
         self.retnorm_scale = 1.0
         self.retnorm_limit = 1.0
         self.retnorm_decay = 0.99
@@ -502,21 +502,27 @@ class DreamerV3:
                 continue_pred.flatten(0, 1), (1 - batch["done"].flatten(0, 1))
             )
 
-            # KL loss with free bits
-            kl_loss = 0
-            for prior, posterior in zip(priors, posteriors):
-                kl_t = torch.distributions.kl_divergence(posterior, prior)
-                kl_t = torch.mean(kl_t, dim=0)  # Average over batch, keep latents
-                kl_t = torch.sum(torch.clamp(kl_t, min=self.config.free_bits))
-                kl_loss += kl_t
-            kl_loss /= len(priors)
+            dyn_loss = torch.stack(
+                [
+                    max(
+                        self.config.free_bits,
+                        torch.distributions.kl_divergence(posterior, prior),
+                    )
+                    for prior, posterior in zip(priors, posteriors)
+                ]
+            ).mean()
+            rep_loss = torch.stack(
+                [
+                    max(
+                        self.config.free_bits,
+                        torch.distributions.kl_divergence(prior, posterior),
+                    )
+                    for prior, posterior in zip(priors, posteriors)
+                ]
+            ).mean()
+            kl_loss += dyn_loss + rep_loss * self.config.rep_loss_scale
 
-            total_loss = (
-                recon_loss
-                + reward_loss
-                + continue_loss
-                + self.config.kl_scale * kl_loss
-            )
+            total_loss = recon_loss + reward_loss + continue_loss + kl_loss
 
         self.scalers["world"].scale(total_loss).backward()
         torch.nn.utils.clip_grad_norm_(
