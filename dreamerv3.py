@@ -39,7 +39,7 @@ class Config:
         self.episodes = 100_000
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.free_bits = 1.0
-        self.entropy_coef = 0.1
+        self.entropy_coef = 3e-4
         self.retnorm_scale = 1.0
         self.retnorm_limit = 1.0
         self.retnorm_decay = 0.99
@@ -439,6 +439,7 @@ class DreamerV3:
         feature_dim = config.deter_dim + config.latent_dim * config.num_classes
         self.actor = Actor(feature_dim, action_dim).to(self.device)
         self.critic = Critic(feature_dim).to(self.device)
+        self.bin_centers = torch.linspace(-20.0, 20.0, 255, device=self.device)
 
         self.optimizers = {
             "world": optim.Adam(
@@ -512,23 +513,24 @@ class DreamerV3:
 
             dyn_loss = torch.stack(
                 [
-                    max(
-                        self.config.free_bits,
-                        torch.distributions.kl_divergence(posterior, prior),
+                    torch.maximum(
+                        torch.tensor(self.config.free_bits, device=self.device),
+                        torch.distributions.kl_divergence(posterior, prior).sum(dim=-1),
                     )
                     for prior, posterior in zip(priors, posteriors)
                 ]
             ).mean()
+
             rep_loss = torch.stack(
                 [
-                    max(
-                        self.config.free_bits,
-                        torch.distributions.kl_divergence(prior, posterior),
+                    torch.maximum(
+                        torch.tensor(self.config.free_bits, device=self.device),
+                        torch.distributions.kl_divergence(prior, posterior).sum(dim=-1),
                     )
                     for prior, posterior in zip(priors, posteriors)
                 ]
             ).mean()
-            kl_loss += dyn_loss + rep_loss * self.config.rep_loss_scale
+            kl_loss = dyn_loss + rep_loss * self.config.rep_loss_scale
 
             total_loss = recon_loss + reward_loss + continue_loss + kl_loss
 
@@ -563,17 +565,17 @@ class DreamerV3:
             flat_features = features.flatten(0, 1)
             reward_logits = self.world_model.reward_decoder(flat_features)
             reward_dist = TwoHotCategoricalStraightThrough(reward_logits)
-            rewards = reward_dist.mean.view(features.shape[0], B, 1)
+            rewards = reward_dist.mean.view(features.shape[0], B)
 
             continue_pred = self.world_model.continue_decoder(flat_features)
-            continues = continue_pred.view(features.shape[0], B, 1)
+            continues = continue_pred.view(features.shape[0], B)
             discounts = self.config.discount * continues
 
             # Compute values from critic
             T, B, _ = features.shape
             critic_logits = self.critic(features.flatten(0, 1))
             probs = F.softmax(critic_logits, dim=-1)
-            values = (probs * self.world_model.reward_decoder.bin_centers).sum(-1)
+            values = (probs * self.bin_centers).sum(-1)
             values = values.view(T, B)
 
             # Compute lambda returns
@@ -599,24 +601,19 @@ class DreamerV3:
 
             # Process replay buffer samples
             replay_batch = self.replay_buffer.sample()
-            _, replay_features, _, replay_reward_dist, replay_continue_pred = (
-                self.world_model.observe(
-                    replay_batch["observation"], replay_batch["action"]
-                )
+            _, replay_features, _, _, _ = self.world_model.observe(
+                replay_batch["observation"], replay_batch["action"]
             )
+            replay_rewards = replay_batch["reward"]
+            replay_dones = replay_batch["done"]
+            replay_continues = (1 - replay_dones.float()) * self.config.discount
 
             # Compute replay returns
             replay_values = (
                 F.softmax(self.critic(replay_features.flatten(0, 1)), -1)
-                * self.world_model.reward_decoder.bin_centers
+                * self.bin_centers
             ).sum(-1)
             replay_values = replay_values.view(replay_features.shape[0], B)
-
-            replay_rewards = replay_reward_dist.mean.view(
-                replay_features.shape[0], B, 1
-            )
-            replay_continues = replay_continue_pred.view(replay_features.shape[0], B, 1)
-            replay_discounts = self.config.discount * replay_continues
 
             replay_lambda_returns = torch.zeros_like(replay_values)
             replay_lambda_returns[-1] = replay_values[-1]
@@ -625,8 +622,13 @@ class DreamerV3:
                     t
                 ] + self.config.gae_lambda * replay_lambda_returns[t + 1]
                 replay_lambda_returns[t] = (
-                    replay_rewards[t] + replay_discounts[t] * blended
+                    replay_rewards[t] + replay_continues[t] * blended
                 )
+
+            # Normalize replay returns using the same scale
+            replay_lambda_returns = replay_lambda_returns / max(
+                1.0, self.config.retnorm_scale
+            )
 
         # Critic update
         self.optimizers["critic"].zero_grad()
