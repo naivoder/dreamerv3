@@ -13,7 +13,9 @@ DreamerV3 is a model-based reinforcement learning algorithm that learns a world 
 3. A critic network that estimates the value of states and actions.
 4. An imagination process that generates trajectories using the learned world model.
 
-This implementation aims to break down these components into clear, modular parts, making it easier to understand and modify.
+This implementation aims to break down these components into clear, modular parts, making it easier to understand and modify. 
+
+Note: This code is written to handle the Atari environments where observations are images, you will need to modify the networks for environments where the observations are vectors. 
 
 ## Setup and Installation
 
@@ -40,15 +42,16 @@ python dreamerv3.py
 
 ### Command-line Arguments
 
-- `--env`: Specify the environment
-- `--episodes`: Number of episodes to train (default: 10000)
-
+- `--env`: Specify the environment (optional)
+- `--wandb_key`: WandB API key for logging (required)
 
 Example:
 
 ```bash
-python dreamerv3.py --env CartPole-v1 --episodes 5000 
+python dreamerv3.py --env MsPacmanNoFrameskip-v4 --wandb_key "../wandb.txt"
 ```
+
+If no env is specified the code will loop through all Atari environments (see full list in `environment.py`)
 
 For a full list of available options, run:  
 
