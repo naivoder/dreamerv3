@@ -69,10 +69,13 @@ def create_animation(env, agent, save_prefix, mod="best", seeds=10):
 def log_hparams(config, run_name):
     with open(config.wandb_key, "r", encoding="utf-8") as f:
         os.environ["WANDB_API_KEY"] = f.read().strip()
-    config.key_path = None
 
     wandb.init(
-        project="dreamerv3-atari", name=run_name, config=vars(config), reinit=True
+        project="dreamerv3-atari",
+        name=run_name,
+        config=vars(config),
+        config_exclude_keys=["key_path"],
+        save_code=True,
     )
 
 
