@@ -315,14 +315,12 @@ class WorldModel(nn.Module):
             nn.Linear(deter_dim + latent_dim * num_classes, 255)
         )
         self.continue_decoder = nn.Sequential(
-            nn.Linear(deter_dim + latent_dim * num_classes, 1), nn.Sigmoid()
+            nn.Linear(deter_dim + latent_dim * num_classes, 1)
         )
 
+        self.apply(utils.init_weights)
         self.reward_decoder[-1].weight.data.zero_()
         self.reward_decoder[-1].bias.data.zero_()
-        self.continue_decoder[-2].weight.data.zero_()
-        self.continue_decoder[-2].bias.data.zero_()
-        self.apply(utils.init_weights)
 
     def observe(self, observations, actions):
         with torch.amp.autocast("cuda"):
