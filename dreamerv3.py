@@ -794,12 +794,10 @@ def train_dreamer(args):
         else:
             state = next_state
 
-    print(f"\nFinished training. Final Avg.Score = {avg_score:.2f}")
+    print(f"\nFinished training. Best Avg.Score = {best_avg:.2f}")
     agent.save_checkpoint(save_prefix + "_final")
+    utils.create_animation(env, agent, save_prefix)
     env.close()
-
-    env = AtariEnv(args.env, shape=(64, 64), repeat=4, clip_rewards=False).make()
-    utils.create_animation(env, agent, save_prefix, mod="best", seeds=10)
 
 
 if __name__ == "__main__":

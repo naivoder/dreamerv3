@@ -42,28 +42,30 @@ def save_animation(frames, filename):
             writer.append_data(frame)
 
 
-def create_animation(env, agent, save_prefix, mod="best", seeds=10):
-    agent.load_checkpoint(save_prefix, mod)
-    best_total_reward, best_frames = float("-inf"), None
+def create_animation(env, agent, save_prefix, seeds=10):
+    for mod in ["best", "best_avg", "final"]:
+        save_path = f"environments/{save_prefix}_{mod}.gif"
+        agent.load_checkpoint(save_prefix, mod)
+        best_total_reward, best_frames = float("-inf"), None
 
-    for _ in range(seeds):
-        state, _ = env.reset()
-        frames, total_reward = [], 0
-        term, trunc = False, False
+        for _ in range(seeds):
+            state, _ = env.reset()
+            frames, total_reward = [], 0
+            term, trunc = False, False
 
-        while not (term or trunc):
-            frames.append(env.render())
-            action = agent.act(state)
-            next_state, reward, term, trunc, _ = env.step(action)
-            total_reward += reward
-            state = next_state
+            while not (term or trunc):
+                frames.append(env.render())
+                action = agent.act(state)
+                next_state, reward, term, trunc, _ = env.step(action)
+                total_reward += reward
+                state = next_state
 
-        if total_reward > best_total_reward:
-            best_total_reward = total_reward
-            best_frames = frames
+            if total_reward > best_total_reward:
+                best_total_reward = total_reward
+                best_frames = frames
 
-    save_animation(best_frames, f"environments/{save_prefix}.gif")
-    env.close()
+        save_animation(best_frames, save_path)
+        wandb.log({f"Animation/{mod}": wandb.Video(save_path, format="gif")})
 
 
 def log_hparams(config, run_name):
