@@ -45,8 +45,6 @@ class Config:
         self.retnorm_decay = 0.99
         self.critic_ema_decay = 0.995
         self.updates_per_step = 1
-        self.ac_grad_clip = 100.0
-        self.world_grad_clip = 1000.0
         self.mixed_precision = True
         self.wandb_key = args.wandb_key
 
@@ -545,9 +543,8 @@ class DreamerV3:
             total_loss = recon_loss + reward_loss + continue_loss + kl_loss
 
         self.scalers["world"].scale(total_loss).backward()
-        torch.nn.utils.clip_grad_norm_(
-            self.world_model.parameters(), self.config.world_grad_clip
-        )
+        self.scalers["world"].unscale_(self.optimizers["world"])
+        utils.adaptive_gradient_clip(self.world_model, clip_factor=0.3, eps=1e-3)
         self.scalers["world"].step(self.optimizers["world"])
         self.scalers["world"].update()
 
@@ -660,9 +657,8 @@ class DreamerV3:
             total_critic_loss = imagination_loss + 0.3 * replay_loss
 
         self.scalers["critic"].scale(total_critic_loss).backward()
-        torch.nn.utils.clip_grad_norm_(
-            self.critic.parameters(), self.config.ac_grad_clip
-        )
+        self.scalers["critic"].unscale_(self.optimizers["critic"])
+        utils.adaptive_gradient_clip(self.critic, clip_factor=0.3, eps=1e-3)
         self.scalers["critic"].step(self.optimizers["critic"])
         self.scalers["critic"].update()
 
@@ -691,9 +687,8 @@ class DreamerV3:
             )
 
         self.scalers["actor"].scale(actor_loss).backward()
-        torch.nn.utils.clip_grad_norm_(
-            self.actor.parameters(), self.config.ac_grad_clip
-        )
+        self.scalers["actor"].unscale_(self.optimizers["actor"])
+        utils.adaptive_gradient_clip(self.actor, clip_factor=0.3, eps=1e-3)
         self.scalers["actor"].step(self.optimizers["actor"])
         self.scalers["actor"].update()
 

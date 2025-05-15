@@ -29,11 +29,15 @@ def init_weights(m):
             nn.init.zeros_(m.bias)
 
 
-def init_weights(m):
-    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d, nn.Linear)):
-        nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
-        if m.bias is not None:
-            nn.init.zeros_(m.bias)
+def adaptive_gradient_clip(model, clip_factor=0.3, eps=1e-3):
+    for param in model.parameters():
+        if param.grad is not None:
+            weight_norm = torch.norm(param.detach(), p=2)  # L2 norm of weights
+            grad_norm = torch.norm(param.grad.detach(), p=2)  # L2 norm of gradients
+            max_norm = clip_factor * weight_norm + eps
+            if grad_norm > max_norm:
+                scale = max_norm / (grad_norm + 1e-8)  # Avoid division by zero
+                param.grad.mul_(scale)  # Scale gradients in-place
 
 
 def save_animation(frames, filename):
