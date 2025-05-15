@@ -31,7 +31,7 @@ class Config:
         self.eps = 1e-5
         self.actor_lr = 4e-5
         self.critic_lr = 4e-5
-        self.discount = 0.99
+        self.discount = 0.997
         self.gae_lambda = 0.95
         self.rep_loss_scale = 0.1
         self.imagination_horizon = 15
@@ -515,7 +515,9 @@ class DreamerV3:
                 [
                     torch.maximum(
                         torch.tensor(self.config.free_bits, device=self.device),
-                        torch.distributions.kl_divergence(posterior, prior).sum(dim=-1),
+                        torch.distributions.kl_divergence(
+                            posterior.detach(), prior
+                        ).sum(dim=-1),
                     )
                     for prior, posterior in zip(priors, posteriors)
                 ]
@@ -525,7 +527,9 @@ class DreamerV3:
                 [
                     torch.maximum(
                         torch.tensor(self.config.free_bits, device=self.device),
-                        torch.distributions.kl_divergence(prior, posterior).sum(dim=-1),
+                        torch.distributions.kl_divergence(
+                            posterior, prior.detach()
+                        ).sum(dim=-1),
                     )
                     for prior, posterior in zip(priors, posteriors)
                 ]
