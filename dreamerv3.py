@@ -520,7 +520,13 @@ class DreamerV3:
                     torch.maximum(
                         torch.tensor(self.config.free_bits, device=self.device),
                         torch.distributions.kl_divergence(
-                            posterior.detach(), prior
+                            Independent(  # Detach posterior logits
+                                OneHotCategoricalStraightThrough(
+                                    logits=posterior.base_dist.logits.detach()
+                                ),
+                                1,
+                            ),
+                            prior,
                         ).sum(dim=-1),
                     )
                     for prior, posterior in zip(priors, posteriors)
@@ -532,14 +538,20 @@ class DreamerV3:
                     torch.maximum(
                         torch.tensor(self.config.free_bits, device=self.device),
                         torch.distributions.kl_divergence(
-                            posterior, prior.detach()
+                            posterior,
+                            Independent(  # Detach prior logits
+                                OneHotCategoricalStraightThrough(
+                                    logits=prior.base_dist.logits.detach()
+                                ),
+                                1,
+                            ),
                         ).sum(dim=-1),
                     )
                     for prior, posterior in zip(priors, posteriors)
                 ]
             ).mean()
-            kl_loss = dyn_loss + rep_loss * self.config.rep_loss_scale
 
+            kl_loss = dyn_loss + rep_loss * self.config.rep_loss_scale
             total_loss = recon_loss + reward_loss + continue_loss + kl_loss
 
         self.scalers["world"].scale(total_loss).backward()
