@@ -43,6 +43,7 @@ class Config:
         self.retnorm_scale = 1.0
         self.retnorm_limit = 1.0
         self.retnorm_decay = 0.99
+        self.critic_ema_decay = 0.995
         self.updates_per_step = 1
         self.ac_grad_clip = 100.0
         self.world_grad_clip = 1000.0
@@ -439,14 +440,19 @@ class DreamerV3:
         feature_dim = config.deter_dim + config.latent_dim * config.num_classes
         self.actor = Actor(feature_dim, action_dim).to(self.device)
         self.critic = Critic(feature_dim).to(self.device)
+        self.target_critic = Critic(feature_dim).to(self.device)
+        self.target_critic.load_state_dict(self.critic.state_dict())
+        for param in self.target_critic.parameters():
+            param.requires_grad = False
+
         self.bin_centers = torch.linspace(-20.0, 20.0, 255, device=self.device)
 
         self.optimizers = {
-            "world": optim.Adam(
+            "world": optim.RAdam(
                 self.world_model.parameters(), lr=config.lr, eps=config.eps
             ),
-            "actor": optim.Adam(self.actor.parameters(), lr=config.actor_lr),
-            "critic": optim.Adam(self.critic.parameters(), lr=config.critic_lr),
+            "actor": optim.RAdam(self.actor.parameters(), lr=config.actor_lr),
+            "critic": optim.RAdam(self.critic.parameters(), lr=config.critic_lr),
         }
         self.scalers = {k: torch.amp.GradScaler("CUDA") for k in self.optimizers}
 
@@ -575,9 +581,9 @@ class DreamerV3:
             continues = continue_pred.view(features.shape[0], B)
             discounts = self.config.discount * continues
 
-            # Compute values from critic
+            # Compute values from target critic
             T, B, _ = features.shape
-            critic_logits = self.critic(features.flatten(0, 1))
+            critic_logits = self.target_critic(features.flatten(0, 1))
             probs = F.softmax(critic_logits, dim=-1)
             values = (probs * self.bin_centers).sum(-1)
             values = values.view(T, B)
@@ -614,7 +620,7 @@ class DreamerV3:
 
             # Compute replay returns
             replay_values = (
-                F.softmax(self.critic(replay_features.flatten(0, 1)), -1)
+                F.softmax(self.target_critic(replay_features.flatten(0, 1)), -1)
                 * self.bin_centers
             ).sum(-1)
             replay_values = replay_values.view(replay_features.shape[0], B)
@@ -660,11 +666,20 @@ class DreamerV3:
         self.scalers["critic"].step(self.optimizers["critic"])
         self.scalers["critic"].update()
 
+        # Update target critic
+        with torch.no_grad():
+            for online_param, target_param in zip(
+                self.critic.parameters(), self.target_critic.parameters()
+            ):
+                target_param.data.mul_(self.config.critic_ema_decay).add_(
+                    online_param.data, alpha=1 - self.config.critic_ema_decay
+                )
+
         # Actor update
         self.optimizers["actor"].zero_grad()
         with torch.amp.autocast("cuda"):
+            values = values / max(1.0, self.config.retnorm_scale)
             advantages = (lambda_returns - values.detach()).flatten(0, 1)
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-5)
 
             action_dist = self.actor(features.flatten(0, 1))
             log_probs = action_dist.log_prob(actions.flatten(0, 1))
