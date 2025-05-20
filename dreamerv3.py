@@ -1,5 +1,4 @@
 import os
-import cv2
 import ale_py
 import gymnasium as gym
 import numpy as np
@@ -20,7 +19,7 @@ torch.backends.cudnn.benchmark = True
 
 class Config:
     def __init__(self, args):
-        self.capacity = 1_000_000
+        self.capacity = 2_000_000
         self.batch_size = 16
         self.sequence_length = 64
         self.embed_dim = 1024
@@ -28,7 +27,7 @@ class Config:
         self.num_classes = 32
         self.deter_dim = 4096
         self.lr = 4e-5
-        self.eps = 1e-5
+        self.eps = 1e-20
         self.actor_lr = 4e-5
         self.critic_lr = 4e-5
         self.discount = 0.997
@@ -43,8 +42,8 @@ class Config:
         self.retnorm_scale = 1.0
         self.retnorm_limit = 1.0
         self.retnorm_decay = 0.99
-        self.critic_ema_decay = 0.995
-        self.updates_per_step = 1
+        self.critic_ema_decay = 0.98
+        self.updates_per_step = 5
         self.mixed_precision = True
         self.wandb_key = args.wandb_key
 
@@ -113,7 +112,7 @@ class OneHotCategoricalStraightThrough(Categorical):
 
 
 class ObservationEncoder(nn.Module):
-    def __init__(self, in_channels, embed_dim):
+    def __init__(self, in_channels=3, embed_dim=1024):
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels, 32, 4, 2),
@@ -135,7 +134,7 @@ class ObservationEncoder(nn.Module):
 
 
 class ObservationDecoder(nn.Module):
-    def __init__(self, feature_dim, out_channels, output_size):
+    def __init__(self, feature_dim, out_channels=3, output_size=(64, 64)):
         super().__init__()
         self.out_channels = out_channels
         self.output_size = output_size
@@ -234,6 +233,9 @@ class RSSM(nn.Module):
         action_oh = F.one_hot(action, self.action_dim).float()
         gru_input = torch.cat([stoch.flatten(1), action_oh], dim=1)
         deter = self.gru(gru_input, deter)
+        if torch.isnan(deter).any():
+            print("NaN detected in GRU input")
+            deter = torch.nan_to_num(deter, nan=0.0)
         prior_logits = self.prior_net(deter).view(-1, self.latent_dim, self.num_classes)
         prior_logits = prior_logits - torch.logsumexp(prior_logits, -1, keepdim=True)
         prior_logits = torch.log(
@@ -445,10 +447,23 @@ class DreamerV3:
 
         self.optimizers = {
             "world": optim.RAdam(
-                self.world_model.parameters(), lr=config.lr, eps=config.eps
+                self.world_model.parameters(),
+                lr=config.lr,
+                eps=config.eps,
+                betas=(0.9, 0.99),
             ),
-            "actor": optim.RAdam(self.actor.parameters(), lr=config.actor_lr),
-            "critic": optim.RAdam(self.critic.parameters(), lr=config.critic_lr),
+            "actor": optim.RAdam(
+                self.actor.parameters(),
+                lr=config.actor_lr,
+                eps=config.eps,
+                betas=(0.9, 0.99),
+            ),
+            "critic": optim.RAdam(
+                self.critic.parameters(),
+                lr=config.critic_lr,
+                eps=config.eps,
+                betas=(0.9, 0.99),
+            ),
         }
         self.scalers = {k: torch.amp.GradScaler("CUDA") for k in self.optimizers}
 
@@ -568,7 +583,7 @@ class DreamerV3:
             "posterior_entropy": post_entropy.item(),
         }
 
-    def update_actor_and_critic(self):
+    def update_actor_and_critic(self, replay_batch):
         B = self.config.batch_size
         init_state = self.world_model.rssm.init_state(B, self.device)
 
@@ -617,7 +632,6 @@ class DreamerV3:
             lambda_returns = lambda_returns / max(1.0, self.config.retnorm_scale)
 
             # Process replay buffer samples
-            replay_batch = self.replay_buffer.sample()
             _, replay_features, _, _, _ = self.world_model.observe(
                 replay_batch["observation"], replay_batch["action"]
             )
@@ -734,7 +748,7 @@ class DreamerV3:
                 losses[k] += v / self.config.updates_per_step
 
             # Actor-critic update
-            ac_losses = self.update_actor_and_critic()
+            ac_losses = self.update_actor_and_critic(batch)
             for k, v in ac_losses.items():
                 losses[k] += v / self.config.updates_per_step
 
@@ -762,7 +776,8 @@ class DreamerV3:
 def train_dreamer(args):
     config = Config(args)
 
-    env = AtariEnv(args.env).make()
+    env = utils.make_env(args.env)
+
     obs_shape = env.observation_space.shape
     act_dim = env.action_space.n
     save_prefix = args.env.split("/")[-1].split("NoFrameskip")[0]

@@ -4,6 +4,26 @@ from torch import nn
 import imageio
 import wandb
 import os
+import gymnasium as gym
+
+
+def make_env(env_name, test=False):
+    env = gym.make(env_name, render_mode="rgb_array")
+    env = gym.wrappers.AtariPreprocessing(
+        env,
+        frame_skip=1,
+        screen_size=64,
+        grayscale_obs=False,
+        scale_obs=True,
+        noop_max=0 if test else 30,
+    )
+    env = gym.wrappers.TransformObservation(
+        env, lambda obs: np.transpose(obs, (2, 0, 1)), None
+    )
+    env.observation_space = gym.spaces.Box(
+        low=0, high=1, shape=(3, 64, 64), dtype=np.float32
+    )
+    return env
 
 
 def preprocess(image):
@@ -98,7 +118,6 @@ def log_losses(ep: int, losses: dict):
             "Entropy/Actor": losses["actor_entropy"],
             "Entropy/Prior": losses["prior_entropy"],
             "Entropy/Posterior": losses["posterior_entropy"],
-            # "Entropy/Reward": losses["reward_entropy"],
         },
         step=ep,
     )
