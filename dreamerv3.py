@@ -5,12 +5,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
 from datetime import datetime
 from torch.distributions import Categorical, Independent
-import warnings
 from environment import ENV_LIST
 import utils
+import warnings
 
 warnings.simplefilter("ignore")
 gym.register_envs(ale_py)
@@ -19,7 +18,7 @@ torch.backends.cudnn.benchmark = True
 
 class Config:
     def __init__(self, args):
-        self.capacity = 2_000_000
+        self.capacity = 1_000_000
         self.batch_size = 16
         self.sequence_length = 64
         self.embed_dim = 1024
@@ -34,75 +33,130 @@ class Config:
         self.gae_lambda = 0.95
         self.rep_loss_scale = 0.1
         self.imagination_horizon = 15
-        self.min_buffer_size = 5000
+        self.min_buffer_size = 100
         self.episodes = 100_000
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda")
         self.free_bits = 1.0
         self.entropy_coef = 3e-4
         self.retnorm_scale = 1.0
         self.retnorm_limit = 1.0
         self.retnorm_decay = 0.99
         self.critic_ema_decay = 0.98
-        self.updates_per_step = 5
+        self.update_interval = 32
+        self.updates_per_step = 1
         self.mixed_precision = True
         self.wandb_key = args.wandb_key
 
 
 class ReplayBuffer:
     def __init__(self, config, device, obs_shape):
-        self.capacity = config.capacity
+        self.num_envs = 16
+        self.capacity = config.capacity // self.num_envs
         self.batch_size = config.batch_size
         self.sequence_length = config.sequence_length
         self.device = device
         self.obs_shape = obs_shape
 
-        self.obs_buf = np.zeros((config.capacity, *obs_shape), dtype=np.uint8)
-        self.act_buf = np.zeros(config.capacity, dtype=np.int16)
-        self.rew_buf = np.zeros(config.capacity, dtype=np.float32)
-        self.done_buf = np.zeros(config.capacity, dtype=np.bool_)
-        self.pos = 0
-        self.full = False
+        self.obs_buf = np.zeros(
+            (self.num_envs, self.capacity, *obs_shape), dtype=np.uint8
+        )
+        self.act_buf = np.zeros((self.num_envs, self.capacity), dtype=np.uint8)
+        self.rew_buf = np.zeros((self.num_envs, self.capacity), dtype=np.float16)
+        self.done_buf = np.zeros((self.num_envs, self.capacity), dtype=np.bool_)
+        self.stoch_buf = np.zeros(
+            (self.num_envs, self.capacity, config.latent_dim, config.num_classes),
+            dtype=np.float16,
+        )
+        self.deter_buf = np.zeros(
+            (self.num_envs, self.capacity, config.deter_dim), dtype=np.float16
+        )
+        self.positions = np.zeros(self.num_envs, dtype=np.int64)
+        self.full = [False] * self.num_envs
 
-    def store(self, obs, act, rew, done):
-        idx = self.pos % self.capacity
-        self.obs_buf[idx] = obs
-        self.act_buf[idx] = act
-        self.rew_buf[idx] = rew
-        self.done_buf[idx] = done
-        self.pos += 1
-        if self.pos >= self.capacity:
-            self.full = True
-            self.pos = 0
+    def store(self, obs, act, rew, done, stoch, deter):
+        for env_idx in range(self.num_envs):
+            pos = self.positions[env_idx]
+            idx = pos % self.capacity
+
+            self.obs_buf[env_idx, idx] = obs[env_idx]
+            self.act_buf[env_idx, idx] = act[env_idx]
+            self.rew_buf[env_idx, idx] = rew[env_idx].astype(np.float16)
+            self.done_buf[env_idx, idx] = done[env_idx]
+            self.stoch_buf[env_idx, idx] = (
+                stoch[env_idx].cpu().numpy().astype(np.float16)
+            )
+            self.deter_buf[env_idx, idx] = (
+                deter[env_idx].cpu().numpy().astype(np.float16)
+            )
+
+            self.positions[env_idx] += 1
+            if self.positions[env_idx] >= self.capacity:
+                self.full[env_idx] = True
+                self.positions[env_idx] = 0
 
     def sample(self):
-        current_size = self.capacity if self.full else self.pos
-        valid_end = current_size - self.sequence_length
+        # Sample one sequence from each environment's buffer
+        indices = []
+        start_indices = []
+        for env_idx in range(self.num_envs):
+            current_size = (
+                self.capacity if self.full[env_idx] else self.positions[env_idx]
+            )
+            valid_end = current_size - self.sequence_length
 
-        start_indices = np.random.randint(0, valid_end, size=self.batch_size)
-        indices = (
-            start_indices[:, None] + np.arange(self.sequence_length)
-        ) % self.capacity
+            if valid_end <= 0:
+                start = 0
+            else:
+                start = np.random.randint(0, valid_end)
 
-        obs = torch.as_tensor(
-            self.obs_buf[indices], dtype=torch.float32, device=self.device
-        )
-        obs = obs.div_(255.0).permute(1, 0, 2, 3, 4)
+            env_indices = (start + np.arange(self.sequence_length)) % self.capacity
+            indices.append(env_indices)
+            start_indices.append(start)
+
+        # Stack indices across environments
+        indices = np.stack(indices)
 
         return {
-            "observation": obs,
+            "initial_stoch": torch.as_tensor(
+                self.stoch_buf[np.arange(self.num_envs), start_indices],
+                device=self.device,
+                dtype=torch.float32,
+            ),
+            "initial_deter": torch.as_tensor(
+                self.deter_buf[np.arange(self.num_envs), start_indices],
+                device=self.device,
+                dtype=torch.float32,
+            ),
+            "observation": torch.as_tensor(
+                self.obs_buf[np.arange(self.num_envs)[:, None], indices],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            .div_(255.0)
+            .permute(1, 0, 2, 3, 4),
             "action": torch.as_tensor(
-                self.act_buf[indices], dtype=torch.long, device=self.device
+                self.act_buf[np.arange(self.num_envs)[:, None], indices],
+                dtype=torch.long,
+                device=self.device,
             ).permute(1, 0),
             "reward": torch.as_tensor(
-                self.rew_buf[indices], dtype=torch.float32, device=self.device
+                self.rew_buf[np.arange(self.num_envs)[:, None], indices],
+                dtype=torch.float32,
+                device=self.device,
             ).permute(1, 0),
             "done": torch.as_tensor(
-                self.done_buf[indices], dtype=torch.float32, device=self.device
+                self.done_buf[np.arange(self.num_envs)[:, None], indices],
+                dtype=torch.float32,
+                device=self.device,
             ).permute(1, 0),
         }
 
     def __len__(self):
-        return self.capacity if self.full else self.pos
+        # Return minimum available length across all environments
+        return min(
+            pos if not full else self.capacity
+            for pos, full in zip(self.positions, self.full)
+        )
 
 
 class LAProp(torch.optim.Optimizer):
@@ -174,7 +228,7 @@ class ObservationEncoder(nn.Module):
         self.apply(utils.init_weights)
 
     def forward(self, x):
-        return self.conv(x)
+        return torch.utils.checkpoint.checkpoint(self.conv, x)
 
 
 class ObservationDecoder(nn.Module):
@@ -200,8 +254,7 @@ class ObservationDecoder(nn.Module):
         self.apply(utils.init_weights)
 
     def forward(self, x):
-        x = self.net(x)
-        return x
+        return torch.utils.checkpoint.checkpoint(self.net, x)
 
 
 class TwoHotCategoricalStraightThrough(torch.distributions.Distribution):
@@ -368,7 +421,7 @@ class WorldModel(nn.Module):
         self.reward_decoder[-1].weight.data.zero_()
         self.reward_decoder[-1].bias.data.zero_()
 
-    def observe(self, observations, actions):
+    def observe(self, observations, actions, stoch, deter):
         embed = self.encoder(observations.flatten(0, 1)).view(
             actions.size(0), actions.size(1), -1
         )
@@ -376,7 +429,6 @@ class WorldModel(nn.Module):
 
         priors, posteriors = [], []
         features = []
-        stoch, deter = self.rssm.init_state(actions.size(1), observations.device)
 
         for t in range(actions.size(0)):
             deter = self.rssm.gru(
@@ -429,8 +481,6 @@ class Actor(nn.Module):
             nn.Linear(512, action_dim),
         )
         self.apply(utils.init_weights)
-        self.net[-1].weight.data.zero_()
-        self.net[-1].bias.data.zero_()
 
     def forward(self, x):
         return Categorical(logits=self.net(x))
@@ -449,7 +499,7 @@ class Critic(nn.Module):
             nn.Linear(512, 512),
             nn.LayerNorm(512),
             nn.SiLU(),
-            nn.Linear(512, 255),  # Output logits for 255 bins
+            nn.Linear(512, 255),
         )
         self.apply(utils.init_weights)
         # Initialize last layer to zeros as per the paper
@@ -467,6 +517,7 @@ class DreamerV3:
         self.config = config
         self.replay_buffer = ReplayBuffer(config, config.device, obs_shape)
         self.device = config.device
+        self.num_envs = 16
 
         self.world_model = WorldModel(
             obs_shape[0],
@@ -508,110 +559,134 @@ class DreamerV3:
                 eps=config.eps,
             ),
         }
+        self.scalers = {
+            "world": torch.amp.GradScaler("cuda"),
+            "actor": torch.amp.GradScaler("cuda"),
+            "critic": torch.amp.GradScaler("cuda"),
+        }
 
-        self.hidden_state = None
+        self.init_hidden_state()
+        self._reset_stoch, self._reset_deter = self.world_model.rssm.init_state(
+            self.num_envs, self.device
+        )
         self.step = 0
 
     def init_hidden_state(self):
-        self.hidden_state = self.world_model.rssm.init_state(1, self.device)
+        self.hidden_state = self.world_model.rssm.init_state(self.num_envs, self.device)
 
-    def act(self, observation):
-        obs = torch.tensor(
-            observation, dtype=torch.float32, device=self.device
-        ).unsqueeze(0)
+    def reset_hidden_states(self, done_indices):
+        """Reset hidden states for specified environment indices"""
+        if not done_indices.any():
+            return
+
+        stoch, deter = self.hidden_state
+        stoch[done_indices] = self._reset_stoch[done_indices]
+        deter[done_indices] = self._reset_deter[done_indices]
+
+    def act(self, observations):
+        obs = torch.tensor(observations, dtype=torch.float32, device=self.device)
         with torch.no_grad():
-            if self.hidden_state is None:
-                self.init_hidden_state()
-
             stoch, deter = self.hidden_state
             embed = self.world_model.encoder(obs)
 
-            # Get posterior
+            # Get posteriors
             post_logits = self.world_model.rssm.observe_step(deter, embed)
             post_logits = post_logits.view(
-                1, self.config.latent_dim, self.config.num_classes
+                self.num_envs, self.config.latent_dim, self.config.num_classes
             )
             stoch = F.gumbel_softmax(post_logits, tau=1.0, hard=True)
 
-            # Get action
+            # Get actions
             feature = torch.cat([deter, stoch.flatten(1)], dim=1)
-            action = self.actor(feature).sample()
+            action_dist = self.actor(feature)
+            actions = action_dist.sample()
 
-            # Update hidden state
-            _, deter = self.world_model.rssm.imagine_step(stoch, deter, action)
+            # Update hidden states
+            _, deter = self.world_model.rssm.imagine_step(stoch, deter, actions)
             self.hidden_state = (stoch, deter)
 
-        return int(action.item())
+        return actions.cpu().numpy()
 
-    def store_transition(self, obs, action, reward, done):
-        self.replay_buffer.store(utils.quantize(obs), action, reward, done)
+    def store_transition(self, obs, actions, rewards, dones):
+        stoch, deter = self.hidden_state
+        with torch.no_grad():
+            obs_tensor = torch.as_tensor(obs, device=self.device)
+            quantized_obs = (obs_tensor * 255).clamp(0, 255).byte().cpu().numpy()
+        self.replay_buffer.store(
+            quantized_obs, actions, rewards, dones, stoch.detach(), deter.detach()
+        )
 
     def update_world_model(self, batch):
         self.optimizers["world"].zero_grad()
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            init_stoch = batch["initial_stoch"]
+            init_deter = batch["initial_deter"]
+            obs, actions = batch["observation"], batch["action"]
 
-        (priors, posteriors), features, recon_dist, reward_dist, continue_pred = (
-            self.world_model.observe(batch["observation"], batch["action"])
-        )
+            (priors, posteriors), features, recon_dist, reward_dist, continue_pred = (
+                self.world_model.observe(obs, actions, init_stoch, init_deter)
+            )
 
-        prior_entropy = torch.stack([p.entropy() for p in priors]).mean()
-        post_entropy = torch.stack([q.entropy() for q in posteriors]).mean()
+            prior_entropy = torch.stack([p.entropy() for p in priors]).mean()
+            post_entropy = torch.stack([q.entropy() for q in posteriors]).mean()
 
-        flat_feat = features.permute(1, 0, 2).flatten(0, 1)
-        obs = batch["observation"]
-        recon_target = obs.permute(1, 0, *range(2, obs.ndim)).flatten(0, 1)
-        recon_pred = self.world_model.decoder(flat_feat)
-        if obs.dtype == torch.uint8:
-            recon_target = recon_target.float() / 255.0
-        recon_loss = F.mse_loss(recon_pred, recon_target, reduction="mean")
+            flat_feat = features.permute(1, 0, 2).flatten(0, 1)
+            obs = batch["observation"]
+            recon_target = obs.permute(1, 0, *range(2, obs.ndim)).flatten(0, 1)
+            recon_pred = self.world_model.decoder(flat_feat)
+            if obs.dtype == torch.uint8:
+                recon_target = recon_target.float() / 255.0
+            recon_loss = F.mse_loss(recon_pred, recon_target, reduction="mean")
 
-        reward_loss = -reward_dist.log_prob(batch["reward"].flatten(0, 1)).mean()
-        continue_loss = F.binary_cross_entropy_with_logits(
-            continue_pred.flatten(0, 1), (1 - batch["done"].flatten(0, 1))
-        )
+            reward_loss = -reward_dist.log_prob(batch["reward"].flatten(0, 1)).mean()
+            continue_loss = F.binary_cross_entropy_with_logits(
+                continue_pred.flatten(0, 1), (1 - batch["done"].flatten(0, 1))
+            )
 
-        dyn_loss = torch.stack(
-            [
-                torch.maximum(
-                    torch.tensor(self.config.free_bits, device=self.device),
-                    torch.distributions.kl_divergence(
-                        Independent(  # Detach posterior logits
-                            OneHotCategoricalStraightThrough(
-                                logits=posterior.base_dist.logits.detach()
+            dyn_loss = torch.stack(
+                [
+                    torch.maximum(
+                        torch.tensor(self.config.free_bits, device=self.device),
+                        torch.distributions.kl_divergence(
+                            Independent(  # Detach posterior logits
+                                OneHotCategoricalStraightThrough(
+                                    logits=posterior.base_dist.logits.detach()
+                                ),
+                                1,
                             ),
-                            1,
-                        ),
-                        prior,
-                    ).sum(dim=-1),
-                )
-                for prior, posterior in zip(priors, posteriors)
-            ]
-        ).mean()
+                            prior,
+                        ).sum(dim=-1),
+                    )
+                    for prior, posterior in zip(priors, posteriors)
+                ]
+            ).mean()
 
-        rep_loss = torch.stack(
-            [
-                torch.maximum(
-                    torch.tensor(self.config.free_bits, device=self.device),
-                    torch.distributions.kl_divergence(
-                        posterior,
-                        Independent(  # Detach prior logits
-                            OneHotCategoricalStraightThrough(
-                                logits=prior.base_dist.logits.detach()
+            rep_loss = torch.stack(
+                [
+                    torch.maximum(
+                        torch.tensor(self.config.free_bits, device=self.device),
+                        torch.distributions.kl_divergence(
+                            posterior,
+                            Independent(  # Detach prior logits
+                                OneHotCategoricalStraightThrough(
+                                    logits=prior.base_dist.logits.detach()
+                                ),
+                                1,
                             ),
-                            1,
-                        ),
-                    ).sum(dim=-1),
-                )
-                for prior, posterior in zip(priors, posteriors)
-            ]
-        ).mean()
+                        ).sum(dim=-1),
+                    )
+                    for prior, posterior in zip(priors, posteriors)
+                ]
+            ).mean()
 
-        kl_loss = dyn_loss + rep_loss * self.config.rep_loss_scale
-        total_loss = recon_loss + reward_loss + continue_loss + kl_loss
+            kl_loss = dyn_loss + rep_loss * self.config.rep_loss_scale
+            total_loss = recon_loss + reward_loss + continue_loss + kl_loss
 
-        self.optimizers["world"].zero_grad()
-        total_loss.backward()
+        self.scalers["world"].scale(total_loss).backward()
+        self.scalers["world"].unscale_(self.optimizers["world"])
         utils.adaptive_gradient_clip(self.world_model, clip_factor=0.3, eps=1e-3)
-        self.optimizers["world"].step()
+        self.scalers["world"].step(self.optimizers["world"])
+        self.scalers["world"].update()
 
         return {
             "world_loss": total_loss.item(),
@@ -625,9 +700,9 @@ class DreamerV3:
 
     def update_actor_and_critic(self, replay_batch):
         B = self.config.batch_size
-        init_state = self.world_model.rssm.init_state(B, self.device)
+        init_state = (replay_batch["initial_stoch"], replay_batch["initial_deter"])
 
-        with torch.no_grad():
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
             # Imagination rollout
             features, actions = self.world_model.rssm.imagine(
                 init_state, self.actor, self.config.imagination_horizon
@@ -673,7 +748,10 @@ class DreamerV3:
 
             # Process replay buffer samples
             _, replay_features, _, _, _ = self.world_model.observe(
-                replay_batch["observation"], replay_batch["action"]
+                replay_batch["observation"],
+                replay_batch["action"],
+                replay_batch["initial_stoch"],
+                replay_batch["initial_deter"],
             )
             replay_rewards = replay_batch["reward"]
             replay_dones = replay_batch["done"]
@@ -718,13 +796,14 @@ class DreamerV3:
 
         total_critic_loss = imagination_loss + 0.3 * replay_loss
 
-        self.optimizers["critic"].zero_grad()
-        total_critic_loss.backward()
+        self.scalers["critic"].scale(total_critic_loss).backward()
+        self.scalers["critic"].unscale_(self.optimizers["critic"])
         utils.adaptive_gradient_clip(self.critic, clip_factor=0.3, eps=1e-3)
-        self.optimizers["critic"].step()
+        self.scalers["critic"].step(self.optimizers["critic"])
+        self.scalers["critic"].update()
 
         # Update target critic
-        with torch.no_grad():
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.float16):
             for online_param, target_param in zip(
                 self.critic.parameters(), self.target_critic.parameters()
             ):
@@ -734,22 +813,24 @@ class DreamerV3:
 
         # Actor update
         self.optimizers["actor"].zero_grad()
-        values = values / max(1.0, self.config.retnorm_scale)
-        advantages = (lambda_returns - values.detach()).flatten(0, 1)
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            values = values / max(1.0, self.config.retnorm_scale)
+            advantages = (lambda_returns - values.detach()).flatten(0, 1)
 
-        action_dist = self.actor(features.flatten(0, 1))
-        log_probs = action_dist.log_prob(actions.flatten(0, 1))
-        entropy = action_dist.entropy().mean()
+            action_dist = self.actor(features.flatten(0, 1))
+            log_probs = action_dist.log_prob(actions.flatten(0, 1))
+            entropy = action_dist.entropy().mean()
 
-        actor_loss = (
-            -(log_probs * advantages.detach()).mean()
-            - self.config.entropy_coef * entropy
-        )
+            actor_loss = (
+                -(log_probs * advantages.detach()).mean()
+                - self.config.entropy_coef * entropy
+            )
 
-        self.optimizers["actor"].zero_grad()
-        actor_loss.backward()
+        self.scalers["actor"].scale(actor_loss).backward()
+        self.scalers["actor"].unscale_(self.optimizers["actor"])
         utils.adaptive_gradient_clip(self.actor, clip_factor=0.3, eps=1e-3)
-        self.optimizers["actor"].step()
+        self.scalers["actor"].step(self.optimizers["actor"])
+        self.scalers["actor"].update()
 
         return {
             "actor_loss": actor_loss.item(),
@@ -811,11 +892,13 @@ class DreamerV3:
 def train_dreamer(args):
     config = Config(args)
 
-    env = utils.make_env(args.env)
+    step_counter = 0
+    env = utils.make_vec_env(args.env, num_envs=16)
+    env = utils.VideoLoggerWrapper(env, "videos", lambda: step_counter)
 
-    obs_shape = env.observation_space.shape
-    act_dim = env.action_space.n
-    save_prefix = args.env.split("/")[-1].split("NoFrameskip")[0]
+    obs_shape = env.single_observation_space.shape
+    act_dim = env.single_action_space.n
+    save_prefix = args.env.split("/")[-1]
     print(f"Env: {save_prefix}, Obs: {obs_shape}, Act: {act_dim}")
 
     agent = DreamerV3(obs_shape, act_dim, config)
@@ -826,47 +909,49 @@ def train_dreamer(args):
 
     episode_history = []
     avg_reward_window = 100
-    best_avg = float("-inf")
-    score = 0
+    best_score, best_avg = float("-inf"), float("-inf")
+    episode_scores = np.zeros(16)
 
-    state, _ = env.reset()
+    states, _ = env.reset()
     agent.init_hidden_state()
 
     while len(episode_history) < config.episodes:
-        action = agent.act(state)
-        next_state, reward, term, trunc, _ = env.step(action)
-        done = term or trunc
-        agent.store_transition(state, action, reward, done)
-        score += reward
+        actions = agent.act(states)
+        next_states, rewards, terms, truncs, _ = env.step(actions)
+        dones = np.logical_or(terms, truncs)
+        agent.store_transition(states, actions, rewards, dones)
+        episode_scores += rewards
 
-        if done:
-            episode_history.append(score)
-            ep = len(episode_history)
+        reset_indices = np.where(dones)[0]
+        if len(reset_indices) > 0:
+            agent.reset_hidden_states(reset_indices)
+            for idx in reset_indices:
+                episode_history.append(episode_scores[idx])
+                episode_scores[idx] = 0
 
-            if len(agent.replay_buffer) >= config.min_buffer_size:
+        step_counter += 1
+        states = next_states
+
+        if len(agent.replay_buffer) >= config.min_buffer_size:
+            if step_counter % config.update_interval == 0:
                 losses = agent.train()
-                utils.log_losses(ep, losses)
+                utils.log_losses(step_counter, losses)
 
-            avg_score = np.mean(episode_history[-avg_reward_window:])
-            buffer_len = len(agent.replay_buffer)
-            utils.log_rewards(ep, score, avg_score, buffer_len, config.episodes)
+        avg_score = np.mean(episode_history[-avg_reward_window:])
+        utils.log_rewards(
+            step_counter, avg_score, best_score, len(episode_history), config.episodes
+        )
 
-            if score >= max(episode_history, default=-np.inf):
-                agent.save_checkpoint(save_prefix + "_best")
+        if max(episode_history, default=float("-inf")) > best_score:
+            best_score = max(episode_history)
+            # agent.save_checkpoint(save_prefix + "_best")
 
-            if avg_score >= best_avg:
-                best_avg = avg_score
-                agent.save_checkpoint(save_prefix + "_best_avg")
-
-            score = 0
-            agent.init_hidden_state()
-            state, _ = env.reset()
-        else:
-            state = next_state
+        if avg_score > best_avg:
+            best_avg = avg_score
+            # agent.save_checkpoint(save_prefix + "_best_avg")
 
     print(f"\nFinished training. Best Avg.Score = {best_avg:.2f}")
     agent.save_checkpoint(save_prefix + "_final")
-    utils.create_animation(env, agent, save_prefix)
     env.close()
 
 
@@ -877,7 +962,7 @@ if __name__ == "__main__":
     parser.add_argument("--env", type=str, default=None)
     parser.add_argument("--wandb_key", type=str, default="../wandb.txt")
     args = parser.parse_args()
-    for folder in ["environments", "weights"]:
+    for folder in ["videos", "weights"]:
         os.makedirs(folder, exist_ok=True)
     if args.env:
         train_dreamer(args)

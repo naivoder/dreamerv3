@@ -5,10 +5,15 @@ import imageio
 import wandb
 import os
 import gymnasium as gym
+import time
 
 
-def make_env(env_name, test=False):
-    env = gym.make(env_name, render_mode="rgb_array")
+def make_env(
+    env_name, record_video=False, video_folder="videos", video_interval=100, test=False
+):
+    env = gym.make(env_name, render_mode="rgb_array" if record_video else None)
+
+    # Existing preprocessing
     env = gym.wrappers.AtariPreprocessing(
         env,
         frame_skip=1,
@@ -23,7 +28,65 @@ def make_env(env_name, test=False):
     env.observation_space = gym.spaces.Box(
         low=0, high=1, shape=(3, 64, 64), dtype=np.float32
     )
+
+    # Add video recording only if requested
+    if record_video:
+        env = gym.wrappers.RecordVideo(
+            env,
+            video_folder=video_folder,
+            episode_trigger=lambda x: x % video_interval == 0,
+            name_prefix=env_name.split("/")[-1],
+        )
+
     return env
+
+
+def make_vec_env(env_name, num_envs=16, video_folder="videos"):
+    os.makedirs(video_folder, exist_ok=True)
+
+    env_fns = [
+        lambda i=i: make_env(
+            env_name,
+            record_video=(i == 0),
+            video_folder=video_folder,
+            video_interval=100,
+        )
+        for i in range(num_envs)
+    ]
+
+    vec_env = gym.vector.AsyncVectorEnv(env_fns)
+    return vec_env
+
+
+class VideoLoggerWrapper(gym.vector.VectorWrapper):
+    def __init__(self, env, video_folder, get_step_callback):
+        super().__init__(env)
+        self.video_folder = video_folder
+        self.last_logged = 0
+        self.get_step = get_step_callback
+
+    def step(self, action):
+        obs, rewards, terminated, truncated, infos = super().step(action)
+
+        current_step = self.get_step()
+
+        new_videos = [
+            f
+            for f in os.listdir(self.video_folder)
+            if f.endswith(".mp4")
+            and os.path.getmtime(os.path.join(self.video_folder, f)) > self.last_logged
+        ]
+
+        for video_file in sorted(
+            new_videos,
+            key=lambda x: os.path.getctime(os.path.join(self.video_folder, x)),
+        ):
+            video_path = os.path.join(self.video_folder, video_file)
+            wandb.log({"video": wandb.Video(video_path)}, step=current_step)
+            os.remove(video_path)
+            self.last_logged = time.time()
+
+        return obs, rewards, terminated, truncated, infos
 
 
 def preprocess(image):
@@ -97,10 +160,9 @@ def log_hparams(config, run_name):
         os.environ["WANDB_API_KEY"] = f.read().strip()
 
     wandb.init(
-        project="dreamerv3-atari",
+        project="dreamerv3-atari-v2",
         name=run_name,
-        config=vars(config),
-        config_exclude_keys=["key_path"],
+        config=wandb.helper.parse_config(config, exclude=("wandb_key",)),
         save_code=True,
     )
 
@@ -124,23 +186,21 @@ def log_losses(ep: int, losses: dict):
 
 
 def log_rewards(
-    ep: int,
-    score: float,
+    step: int,
     avg_score: float,
-    buffer_len: int,
+    best_score: float,
+    episode: int,
     total_episodes: int,
 ):
     wandb.log(
         {
-            "Reward/Score": score,
             "Reward/Average": avg_score,
-            "Buffer/Length": buffer_len,
+            "Reward/Best": best_score,
         },
-        step=ep,
+        step=step,
     )
 
-    e_str = f"[Ep {ep:05d}/{total_episodes}]"
-    s_str = f"Score = {score:8.2f}"
+    e_str = f"[Ep {episode:05d}/{total_episodes}]"
     a_str = f"Avg.Score = {avg_score:8.2f}"
-    b_str = f"Mem.Length = {buffer_len:07d}"
-    print(f"{e_str}  {s_str}   {a_str}   {b_str}", end="\r")
+    b_str = f"Best.Score = {best_score:8.2f}"
+    print(f"{e_str} {a_str} {b_str} step = {step}", end="\r")
