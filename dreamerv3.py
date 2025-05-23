@@ -9,7 +9,7 @@ import torch.optim as optim
 from datetime import datetime
 from torch.distributions import Categorical, Independent
 import warnings
-from environment import AtariEnv, ENV_LIST
+from environment import ENV_LIST
 import utils
 
 warnings.simplefilter("ignore")
@@ -103,6 +103,50 @@ class ReplayBuffer:
 
     def __len__(self):
         return self.capacity if self.full else self.pos
+
+
+class LAProp(torch.optim.Optimizer):
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.99), eps=1e-20):
+        defaults = dict(lr=lr, betas=betas, eps=eps)
+        super().__init__(params, defaults)
+        self.state["step"] = 0
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            loss = closure()
+
+        for group in self.param_groups:
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+                state = self.state[p]
+
+                if len(state) == 0:
+                    state["exp_avg_sq"] = torch.zeros_like(p)
+                    state["momentum_buffer"] = torch.zeros_like(p)
+
+                exp_avg_sq = state["exp_avg_sq"]
+                momentum_buffer = state["momentum_buffer"]
+
+                # RMSProp update
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                denom = exp_avg_sq.sqrt().add_(eps)
+                normalized_grad = grad / denom
+
+                # Momentum update
+                momentum_buffer.mul_(beta1).add_(normalized_grad, alpha=1 - beta1)
+
+                # Parameter update
+                p.add_(momentum_buffer, alpha=-group["lr"])
+
+        return loss
 
 
 class OneHotCategoricalStraightThrough(Categorical):
@@ -325,47 +369,46 @@ class WorldModel(nn.Module):
         self.reward_decoder[-1].bias.data.zero_()
 
     def observe(self, observations, actions):
-        with torch.amp.autocast("cuda"):
-            embed = self.encoder(observations.flatten(0, 1)).view(
-                actions.size(0), actions.size(1), -1
+        embed = self.encoder(observations.flatten(0, 1)).view(
+            actions.size(0), actions.size(1), -1
+        )
+        actions_onehot = F.one_hot(actions, self.rssm.action_dim).float()
+
+        priors, posteriors = [], []
+        features = []
+        stoch, deter = self.rssm.init_state(actions.size(1), observations.device)
+
+        for t in range(actions.size(0)):
+            deter = self.rssm.gru(
+                torch.cat([stoch.flatten(1), actions_onehot[t]], dim=1), deter
             )
-            actions_onehot = F.one_hot(actions, self.rssm.action_dim).float()
 
-            priors, posteriors = [], []
-            features = []
-            stoch, deter = self.rssm.init_state(actions.size(1), observations.device)
-
-            for t in range(actions.size(0)):
-                deter = self.rssm.gru(
-                    torch.cat([stoch.flatten(1), actions_onehot[t]], dim=1), deter
-                )
-
-                prior_logits = self.rssm.prior_net(deter).view(
-                    deter.size(0), self.rssm.latent_dim, self.rssm.num_classes
-                )
-                prior_dist = Independent(
-                    OneHotCategoricalStraightThrough(logits=prior_logits), 1
-                )
-
-                post_logits = self.rssm.post_net(torch.cat([deter, embed[t]], dim=1))
-                post_logits = post_logits.view(
-                    deter.size(0), self.rssm.latent_dim, self.rssm.num_classes
-                )
-                post_dist = Independent(
-                    OneHotCategoricalStraightThrough(logits=post_logits), 1
-                )
-
-                stoch = F.gumbel_softmax(post_logits, tau=1.0, hard=True)
-                features.append(torch.cat([deter, stoch.flatten(1)], dim=1))
-                priors.append(prior_dist)
-                posteriors.append(post_dist)
-
-            features = torch.stack(features)
-            recon_dist = self.decoder(features.flatten(0, 1))
-            reward_dist = TwoHotCategoricalStraightThrough(
-                self.reward_decoder(features.flatten(0, 1))
+            prior_logits = self.rssm.prior_net(deter).view(
+                deter.size(0), self.rssm.latent_dim, self.rssm.num_classes
             )
-            continue_pred = self.continue_decoder(features.flatten(0, 1))
+            prior_dist = Independent(
+                OneHotCategoricalStraightThrough(logits=prior_logits), 1
+            )
+
+            post_logits = self.rssm.post_net(torch.cat([deter, embed[t]], dim=1))
+            post_logits = post_logits.view(
+                deter.size(0), self.rssm.latent_dim, self.rssm.num_classes
+            )
+            post_dist = Independent(
+                OneHotCategoricalStraightThrough(logits=post_logits), 1
+            )
+
+            stoch = F.gumbel_softmax(post_logits, tau=1.0, hard=True)
+            features.append(torch.cat([deter, stoch.flatten(1)], dim=1))
+            priors.append(prior_dist)
+            posteriors.append(post_dist)
+
+        features = torch.stack(features)
+        recon_dist = self.decoder(features.flatten(0, 1))
+        reward_dist = TwoHotCategoricalStraightThrough(
+            self.reward_decoder(features.flatten(0, 1))
+        )
+        continue_pred = self.continue_decoder(features.flatten(0, 1))
 
         return (priors, posteriors), features, recon_dist, reward_dist, continue_pred
 
@@ -446,26 +489,25 @@ class DreamerV3:
         self.bin_centers = torch.linspace(-20.0, 20.0, 255, device=self.device)
 
         self.optimizers = {
-            "world": optim.RAdam(
+            "world": LAProp(
                 self.world_model.parameters(),
                 lr=config.lr,
-                eps=config.eps,
                 betas=(0.9, 0.99),
+                eps=config.eps,
             ),
-            "actor": optim.RAdam(
+            "actor": LAProp(
                 self.actor.parameters(),
                 lr=config.actor_lr,
-                eps=config.eps,
                 betas=(0.9, 0.99),
+                eps=config.eps,
             ),
-            "critic": optim.RAdam(
+            "critic": LAProp(
                 self.critic.parameters(),
                 lr=config.critic_lr,
-                eps=config.eps,
                 betas=(0.9, 0.99),
+                eps=config.eps,
             ),
         }
-        self.scalers = {k: torch.amp.GradScaler("CUDA") for k in self.optimizers}
 
         self.hidden_state = None
         self.step = 0
@@ -507,71 +549,69 @@ class DreamerV3:
     def update_world_model(self, batch):
         self.optimizers["world"].zero_grad()
 
-        with torch.amp.autocast("cuda"):
-            (priors, posteriors), features, recon_dist, reward_dist, continue_pred = (
-                self.world_model.observe(batch["observation"], batch["action"])
-            )
+        (priors, posteriors), features, recon_dist, reward_dist, continue_pred = (
+            self.world_model.observe(batch["observation"], batch["action"])
+        )
 
-            prior_entropy = torch.stack([p.entropy() for p in priors]).mean()
-            post_entropy = torch.stack([q.entropy() for q in posteriors]).mean()
+        prior_entropy = torch.stack([p.entropy() for p in priors]).mean()
+        post_entropy = torch.stack([q.entropy() for q in posteriors]).mean()
 
-            flat_feat = features.permute(1, 0, 2).flatten(0, 1)
-            obs = batch["observation"]
-            recon_target = obs.permute(1, 0, *range(2, obs.ndim)).flatten(0, 1)
-            recon_pred = self.world_model.decoder(flat_feat)
-            if obs.dtype == torch.uint8:
-                recon_target = recon_target.float() / 255.0
-            recon_loss = F.mse_loss(recon_pred, recon_target, reduction="mean")
+        flat_feat = features.permute(1, 0, 2).flatten(0, 1)
+        obs = batch["observation"]
+        recon_target = obs.permute(1, 0, *range(2, obs.ndim)).flatten(0, 1)
+        recon_pred = self.world_model.decoder(flat_feat)
+        if obs.dtype == torch.uint8:
+            recon_target = recon_target.float() / 255.0
+        recon_loss = F.mse_loss(recon_pred, recon_target, reduction="mean")
 
-            reward_loss = -reward_dist.log_prob(batch["reward"].flatten(0, 1)).mean()
-            continue_loss = F.binary_cross_entropy_with_logits(
-                continue_pred.flatten(0, 1), (1 - batch["done"].flatten(0, 1))
-            )
+        reward_loss = -reward_dist.log_prob(batch["reward"].flatten(0, 1)).mean()
+        continue_loss = F.binary_cross_entropy_with_logits(
+            continue_pred.flatten(0, 1), (1 - batch["done"].flatten(0, 1))
+        )
 
-            dyn_loss = torch.stack(
-                [
-                    torch.maximum(
-                        torch.tensor(self.config.free_bits, device=self.device),
-                        torch.distributions.kl_divergence(
-                            Independent(  # Detach posterior logits
-                                OneHotCategoricalStraightThrough(
-                                    logits=posterior.base_dist.logits.detach()
-                                ),
-                                1,
+        dyn_loss = torch.stack(
+            [
+                torch.maximum(
+                    torch.tensor(self.config.free_bits, device=self.device),
+                    torch.distributions.kl_divergence(
+                        Independent(  # Detach posterior logits
+                            OneHotCategoricalStraightThrough(
+                                logits=posterior.base_dist.logits.detach()
                             ),
-                            prior,
-                        ).sum(dim=-1),
-                    )
-                    for prior, posterior in zip(priors, posteriors)
-                ]
-            ).mean()
+                            1,
+                        ),
+                        prior,
+                    ).sum(dim=-1),
+                )
+                for prior, posterior in zip(priors, posteriors)
+            ]
+        ).mean()
 
-            rep_loss = torch.stack(
-                [
-                    torch.maximum(
-                        torch.tensor(self.config.free_bits, device=self.device),
-                        torch.distributions.kl_divergence(
-                            posterior,
-                            Independent(  # Detach prior logits
-                                OneHotCategoricalStraightThrough(
-                                    logits=prior.base_dist.logits.detach()
-                                ),
-                                1,
+        rep_loss = torch.stack(
+            [
+                torch.maximum(
+                    torch.tensor(self.config.free_bits, device=self.device),
+                    torch.distributions.kl_divergence(
+                        posterior,
+                        Independent(  # Detach prior logits
+                            OneHotCategoricalStraightThrough(
+                                logits=prior.base_dist.logits.detach()
                             ),
-                        ).sum(dim=-1),
-                    )
-                    for prior, posterior in zip(priors, posteriors)
-                ]
-            ).mean()
+                            1,
+                        ),
+                    ).sum(dim=-1),
+                )
+                for prior, posterior in zip(priors, posteriors)
+            ]
+        ).mean()
 
-            kl_loss = dyn_loss + rep_loss * self.config.rep_loss_scale
-            total_loss = recon_loss + reward_loss + continue_loss + kl_loss
+        kl_loss = dyn_loss + rep_loss * self.config.rep_loss_scale
+        total_loss = recon_loss + reward_loss + continue_loss + kl_loss
 
-        self.scalers["world"].scale(total_loss).backward()
-        self.scalers["world"].unscale_(self.optimizers["world"])
+        self.optimizers["world"].zero_grad()
+        total_loss.backward()
         utils.adaptive_gradient_clip(self.world_model, clip_factor=0.3, eps=1e-3)
-        self.scalers["world"].step(self.optimizers["world"])
-        self.scalers["world"].update()
+        self.optimizers["world"].step()
 
         return {
             "world_loss": total_loss.item(),
@@ -587,7 +627,7 @@ class DreamerV3:
         B = self.config.batch_size
         init_state = self.world_model.rssm.init_state(B, self.device)
 
-        with torch.no_grad(), torch.amp.autocast("cuda"):
+        with torch.no_grad():
             # Imagination rollout
             features, actions = self.world_model.rssm.imagine(
                 init_state, self.actor, self.config.imagination_horizon
@@ -663,28 +703,25 @@ class DreamerV3:
 
         # Critic update
         self.optimizers["critic"].zero_grad()
-        with torch.amp.autocast("cuda"):
-            # Imagination loss
-            critic_logits = self.critic(features.flatten(0, 1))
-            critic_dist = TwoHotCategoricalStraightThrough(critic_logits)
-            imagination_loss = -critic_dist.log_prob(
-                lambda_returns.flatten(0, 1)
-            ).mean()
 
-            # Replay loss
-            replay_critic_logits = self.critic(replay_features.flatten(0, 1))
-            replay_critic_dist = TwoHotCategoricalStraightThrough(replay_critic_logits)
-            replay_loss = -replay_critic_dist.log_prob(
-                replay_lambda_returns.flatten(0, 1)
-            ).mean()
+        # Imagination loss
+        critic_logits = self.critic(features.flatten(0, 1))
+        critic_dist = TwoHotCategoricalStraightThrough(critic_logits)
+        imagination_loss = -critic_dist.log_prob(lambda_returns.flatten(0, 1)).mean()
 
-            total_critic_loss = imagination_loss + 0.3 * replay_loss
+        # Replay loss
+        replay_critic_logits = self.critic(replay_features.flatten(0, 1))
+        replay_critic_dist = TwoHotCategoricalStraightThrough(replay_critic_logits)
+        replay_loss = -replay_critic_dist.log_prob(
+            replay_lambda_returns.flatten(0, 1)
+        ).mean()
 
-        self.scalers["critic"].scale(total_critic_loss).backward()
-        self.scalers["critic"].unscale_(self.optimizers["critic"])
+        total_critic_loss = imagination_loss + 0.3 * replay_loss
+
+        self.optimizers["critic"].zero_grad()
+        total_critic_loss.backward()
         utils.adaptive_gradient_clip(self.critic, clip_factor=0.3, eps=1e-3)
-        self.scalers["critic"].step(self.optimizers["critic"])
-        self.scalers["critic"].update()
+        self.optimizers["critic"].step()
 
         # Update target critic
         with torch.no_grad():
@@ -697,24 +734,22 @@ class DreamerV3:
 
         # Actor update
         self.optimizers["actor"].zero_grad()
-        with torch.amp.autocast("cuda"):
-            values = values / max(1.0, self.config.retnorm_scale)
-            advantages = (lambda_returns - values.detach()).flatten(0, 1)
+        values = values / max(1.0, self.config.retnorm_scale)
+        advantages = (lambda_returns - values.detach()).flatten(0, 1)
 
-            action_dist = self.actor(features.flatten(0, 1))
-            log_probs = action_dist.log_prob(actions.flatten(0, 1))
-            entropy = action_dist.entropy().mean()
+        action_dist = self.actor(features.flatten(0, 1))
+        log_probs = action_dist.log_prob(actions.flatten(0, 1))
+        entropy = action_dist.entropy().mean()
 
-            actor_loss = (
-                -(log_probs * advantages.detach()).mean()
-                - self.config.entropy_coef * entropy
-            )
+        actor_loss = (
+            -(log_probs * advantages.detach()).mean()
+            - self.config.entropy_coef * entropy
+        )
 
-        self.scalers["actor"].scale(actor_loss).backward()
-        self.scalers["actor"].unscale_(self.optimizers["actor"])
+        self.optimizers["actor"].zero_grad()
+        actor_loss.backward()
         utils.adaptive_gradient_clip(self.actor, clip_factor=0.3, eps=1e-3)
-        self.scalers["actor"].step(self.optimizers["actor"])
-        self.scalers["actor"].update()
+        self.optimizers["actor"].step()
 
         return {
             "actor_loss": actor_loss.item(),
