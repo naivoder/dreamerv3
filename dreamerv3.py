@@ -18,7 +18,7 @@ torch.backends.cudnn.benchmark = True
 
 class Config:
     def __init__(self, args):
-        self.capacity = 1_000_000
+        self.capacity = 2_000_000
         self.batch_size = 16
         self.sequence_length = 64
         self.embed_dim = 1024
@@ -33,7 +33,7 @@ class Config:
         self.gae_lambda = 0.95
         self.rep_loss_scale = 0.1
         self.imagination_horizon = 15
-        self.min_buffer_size = 100
+        self.min_buffer_size = 500
         self.episodes = 100_000
         self.device = torch.device("cuda")
         self.free_bits = 1.0
@@ -42,7 +42,7 @@ class Config:
         self.retnorm_limit = 1.0
         self.retnorm_decay = 0.99
         self.critic_ema_decay = 0.98
-        self.update_interval = 32
+        self.update_interval = 2
         self.updates_per_step = 1
         self.mixed_precision = True
         self.wandb_key = args.wandb_key
@@ -154,6 +154,13 @@ class ReplayBuffer:
     def __len__(self):
         # Return minimum available length across all environments
         return min(
+            pos if not full else self.capacity
+            for pos, full in zip(self.positions, self.full)
+        )
+
+    def size(self):
+        # Return total size of the buffer
+        return sum(
             pos if not full else self.capacity
             for pos, full in zip(self.positions, self.full)
         )
@@ -814,8 +821,12 @@ class DreamerV3:
         # Actor update
         self.optimizers["actor"].zero_grad()
         with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-            values = values / max(1.0, self.config.retnorm_scale)
-            advantages = (lambda_returns - values.detach()).flatten(0, 1)
+            online_probs = F.softmax(critic_logits, dim=-1)
+            online_values = (
+                (online_probs * self.bin_centers).sum(-1).view(features.shape[0], B)
+            )
+            online_values = online_values / max(1.0, self.config.retnorm_scale)
+            advantages = (lambda_returns - online_values.detach()).flatten(0, 1)
 
             action_dist = self.actor(features.flatten(0, 1))
             log_probs = action_dist.log_prob(actions.flatten(0, 1))
@@ -938,8 +949,14 @@ def train_dreamer(args):
                 utils.log_losses(step_counter, losses)
 
         avg_score = np.mean(episode_history[-avg_reward_window:])
+        mem_size = agent.replay_buffer.size()
         utils.log_rewards(
-            step_counter, avg_score, best_score, len(episode_history), config.episodes
+            step_counter,
+            avg_score,
+            best_score,
+            mem_size,
+            len(episode_history),
+            config.episodes,
         )
 
         if max(episode_history, default=float("-inf")) > best_score:
