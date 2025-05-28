@@ -13,7 +13,6 @@ def make_env(
 ):
     env = gym.make(env_name, render_mode="rgb_array" if record_video else None)
 
-    # Existing preprocessing
     env = gym.wrappers.AtariPreprocessing(
         env,
         frame_skip=1,
@@ -29,7 +28,6 @@ def make_env(
         low=0, high=1, shape=(3, 64, 64), dtype=np.float32
     )
 
-    # Add video recording only if requested
     if record_video:
         env = gym.wrappers.RecordVideo(
             env,
@@ -49,7 +47,7 @@ def make_vec_env(env_name, num_envs=16, video_folder="videos"):
             env_name,
             record_video=(i == 0),
             video_folder=video_folder,
-            video_interval=100,
+            video_interval=1000,
         )
         for i in range(num_envs)
     ]
@@ -189,6 +187,7 @@ def log_rewards(
     step: int,
     avg_score: float,
     best_score: float,
+    mem_size: int,
     episode: int,
     total_episodes: int,
 ):
@@ -196,6 +195,7 @@ def log_rewards(
         {
             "Reward/Average": avg_score,
             "Reward/Best": best_score,
+            "Memory/Size": mem_size,
         },
         step=step,
     )
@@ -203,4 +203,6 @@ def log_rewards(
     e_str = f"[Ep {episode:05d}/{total_episodes}]"
     a_str = f"Avg.Score = {avg_score:8.2f}"
     b_str = f"Best.Score = {best_score:8.2f}"
-    print(f"{e_str} {a_str} {b_str} step = {step}", end="\r")
+    s_str = f"Step = {step:8d}"
+    m_str = f"Mem.Size = {mem_size:7d}"
+    print(f"{e_str} {a_str} {b_str} {m_str} {s_str}", end="\r")
