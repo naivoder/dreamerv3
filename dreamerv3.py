@@ -334,6 +334,7 @@ class RSSM(nn.Module):
 
     def imagine_step(self, stoch, deter, action):
         # Use prior network
+        stoch = utils.symlog(stoch)
         action_oh = F.one_hot(action, self.action_dim).float()
         gru_input = torch.cat([stoch.flatten(1), action_oh], dim=1)
         deter = self.gru(gru_input, deter)
@@ -346,7 +347,7 @@ class RSSM(nn.Module):
             0.99 * torch.softmax(prior_logits, -1) + 0.01 / self.num_classes
         )
         stoch = F.gumbel_softmax(prior_logits, tau=1.0, hard=True)
-        return stoch, deter
+        return utils.symexp(stoch), deter
 
     def observe_step(self, deter, embed):
         # Use posterior network
@@ -719,7 +720,7 @@ class DreamerV3:
             flat_features = features.flatten(0, 1)
             reward_logits = self.world_model.reward_decoder(flat_features)
             reward_dist = TwoHotCategoricalStraightThrough(reward_logits)
-            rewards = reward_dist.mean.view(features.shape[0], B)
+            rewards = utils.symlog(reward_dist.mean.view(features.shape[0], B))
 
             continue_pred = self.world_model.continue_decoder(flat_features)
             continues = continue_pred.view(features.shape[0], B)
