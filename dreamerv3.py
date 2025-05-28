@@ -822,12 +822,7 @@ class DreamerV3:
         # Actor update
         self.optimizers["actor"].zero_grad()
         with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-            online_probs = F.softmax(critic_logits, dim=-1)
-            online_values = (
-                (online_probs * self.bin_centers).sum(-1).view(features.shape[0], B)
-            )
-            online_values = online_values / max(1.0, self.config.retnorm_scale)
-            advantages = (lambda_returns - online_values.detach()).flatten(0, 1)
+            advantages = (lambda_returns - values.detach()).flatten(0, 1)
 
             action_dist = self.actor(features.flatten(0, 1))
             log_probs = action_dist.log_prob(actions.flatten(0, 1))
