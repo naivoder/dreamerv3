@@ -1,0 +1,29 @@
+name: gym-pytorch
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+  - numpy
+  - matplotlib
+  - jupyter
+  - ipykernel
+  - tensorboard
+  - opencv
+  - imageio
+  - swig
+  - box2d-py
+  - termcolor
+  - gymnasium
+  - wandb
+  - tqdm
+  - pip
+
+
