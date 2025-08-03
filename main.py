@@ -1665,7 +1665,7 @@ def evaluate_and_save_gif(agent: DreamerV3, env_name: str, num_episodes: int = 5
 
         agent.prev_action = None
 
-        while not done and episode_length < 1000:
+        while not done:
             frames.append(env.render())
 
             action, state = agent.act(obs, state, training=False)
