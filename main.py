@@ -65,7 +65,7 @@ class Config:
     batch_size: int = 16
     sequence_length: int = 64
     replay_ratio: int = 128
-    buffer_size: int = 5_000_000
+    buffer_size: int = 1_000_000
     deter_size: int = 1024
     stoch_size: int = 16
     stoch_discrete: int = 16
@@ -85,7 +85,6 @@ class Config:
     gamma: float = 0.997
     lambda_: float = 0.95
     entropy_scale: float = 3e-4
-    grad_clip_norm: float = 100.0
     weight_decay: float = 1e-6
     ema_decay: float = 0.98
     symlog_eps: float = 1e-8
@@ -929,14 +928,15 @@ class DreamerV3:
 
         return all_metrics
 
-    def _adaptive_clip_grad(self, model: nn.Module, max_norm: float):
+    def _adaptive_clip_grad(self, model: nn.Module):
         for param in model.parameters():
-            if param.grad is not None and len(param.shape) >= 2:
-                weight_norm = param.data.norm()
-                grad_norm = param.grad.data.norm()
-
-                clip_coef = (0.1 * weight_norm / (grad_norm + 1e-6)).clamp(max=1.0)
-                param.grad.data.mul_(clip_coef)
+            if param.grad is not None and param.numel() >= 2:
+                weight_norm = torch.norm(param.data, p=2)
+                grad_norm = torch.norm(param.grad.data, p=2)
+                max_grad_norm = 0.3 * weight_norm
+                if grad_norm > max_grad_norm:
+                    clip_scale = max_grad_norm / (grad_norm + 1e-3)
+                    param.grad.data.mul_(clip_scale)
 
     def _train_world_model(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
         obs = batch["obs"]
@@ -983,12 +983,7 @@ class DreamerV3:
 
         self.world_opt.zero_grad()
         loss.backward()
-
-        self._adaptive_clip_grad(self.world_model, self.config.grad_clip_norm)
-        torch.nn.utils.clip_grad_norm_(
-            self.world_model.parameters(), self.config.grad_clip_norm
-        )
-
+        self._adaptive_clip_grad(self.world_model)
         self.world_opt.step()
 
         with torch.no_grad():
@@ -1251,10 +1246,7 @@ class DreamerV3:
 
         self.critic_opt.zero_grad()
         critic_loss.backward()
-        self._adaptive_clip_grad(self.critic, self.config.grad_clip_norm)
-        torch.nn.utils.clip_grad_norm_(
-            self.critic.parameters(), self.config.grad_clip_norm
-        )
+        self._adaptive_clip_grad(self.critic)
         self.critic_opt.step()
 
         with torch.no_grad():
@@ -1387,10 +1379,7 @@ class DreamerV3:
 
         self.actor_opt.zero_grad()
         total_loss.backward()
-        self._adaptive_clip_grad(self.actor, self.config.grad_clip_norm)
-        torch.nn.utils.clip_grad_norm_(
-            self.actor.parameters(), self.config.grad_clip_norm
-        )
+        self._adaptive_clip_grad(self.actor)
         self.actor_opt.step()
 
         return {
