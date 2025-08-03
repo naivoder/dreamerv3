@@ -1441,12 +1441,12 @@ def train_dreamer(
 
     config = Config()
 
-    if "Atari" in env_name or "ALE" in env_name:
-        config.action_repeat = 4
-    elif "CarRacing" in env_name:
-        config.action_repeat = 2
-    else:
-        config.action_repeat = 1
+    # if "Atari" in env_name or "ALE" in env_name:
+    #     config.action_repeat = 4
+    # elif "CarRacing" in env_name:
+    #     config.action_repeat = 2
+    # else:
+    #     config.action_repeat = 1
 
     agent = DreamerV3(obs_shape, action_dim, config, discrete)
 
