@@ -9,6 +9,8 @@ csv/
 runs/
 wandb/
 videos/
+gifs/
+models/
 *.csv
 
 old.py

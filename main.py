@@ -1,3 +1,14 @@
+"""
+DreamerV3 implementation in PyTorch.
+
+Discrepancies with official implementation:
+- Using AdamW optimizer instead of LaProp
+- Using LayerNorm instead of RMSNorm
+- Not currently handling action repeat (i.e. always = 1)
+- Need custom Atari env wrapper
+- Not using Block GRU
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -13,6 +24,7 @@ import os
 from datetime import datetime
 import time
 import warnings
+import traceback
 
 warnings.simplefilter("ignore")
 
@@ -52,49 +64,36 @@ def spinning_cursor():
 class Config:
     batch_size: int = 16
     sequence_length: int = 64
-    replay_ratio: int = 64
-    buffer_size: int = 1000000
-
+    replay_ratio: int = 128
+    buffer_size: int = 5_000_000
     deter_size: int = 1024
     stoch_size: int = 16
     stoch_discrete: int = 16
     hidden_size: int = 256
-
     cnn_depth: int = 48
     cnn_kernels: List[int] = (4, 4, 4, 4)
     cnn_strides: List[int] = (2, 2, 2, 2)
-
     model_lr: float = 4e-5
     actor_lr: float = 4e-5
     critic_lr: float = 4e-5
-
-    kl_weight: float = 1.0
-    kl_balance: float = 1.0
     free_nats: float = 1.0
     pred_weight: float = 1.0
     dyn_weight: float = 1.0
     rep_weight: float = 0.1
-
     critic_weight: float = 1.0
     critic_replay_weight: float = 0.3
-
     gamma: float = 0.997
     lambda_: float = 0.95
     entropy_scale: float = 3e-4
     grad_clip_norm: float = 100.0
     weight_decay: float = 1e-6
     ema_decay: float = 0.98
-
     symlog_eps: float = 1e-8
-
     twohot_bins: int = 255
     twohot_min: float = -20.0
     twohot_max: float = 20.0
-
     unimix: float = 0.01
-
     horizon: int = 15
-
     return_norm_type: str = "percentile"
     return_norm_decay: float = 0.99
     return_norm_limit: float = 1.0
@@ -348,14 +347,28 @@ class RSSM(nn.Module):
         stoch = posterior.rsample()
         state = {"deter": deter, "stoch": stoch}
 
-        prior_dist = prior.cat
-        post_dist = posterior.cat
-        kl_raw = D.kl_divergence(post_dist, prior_dist).sum(dim=-1)
-        kl_balanced = (
-            1 - self.config.kl_balance
-        ) * kl_raw.detach() + self.config.kl_balance * kl_raw
+        batch_size = prior_logits.shape[0]
 
-        return state, prior, kl_balanced
+        prior_logits_flat = prior_logits.reshape(-1, self.config.stoch_discrete)
+        posterior_logits_flat = posterior_logits.reshape(-1, self.config.stoch_discrete)
+
+        prior_dist = D.Categorical(logits=prior_logits_flat)
+        posterior_dist = D.Categorical(logits=posterior_logits_flat)
+
+        prior_dist_no_grad = D.Categorical(logits=prior_logits_flat)
+        posterior_dist_detached = D.Categorical(logits=posterior_logits_flat.detach())
+        kl_dyn_flat = D.kl_divergence(prior_dist_no_grad, posterior_dist_detached)
+        kl_dyn_raw = kl_dyn_flat.reshape(batch_size, self.config.stoch_size).sum(dim=-1)
+
+        posterior_dist_no_grad = D.Categorical(logits=posterior_logits_flat)
+        prior_dist_detached = D.Categorical(logits=prior_logits_flat.detach())
+        kl_rep_flat = D.kl_divergence(posterior_dist_no_grad, prior_dist_detached)
+        kl_rep_raw = kl_rep_flat.reshape(batch_size, self.config.stoch_size).sum(dim=-1)
+
+        kl_dyn = torch.maximum(kl_dyn_raw, torch.tensor(self.config.free_nats))
+        kl_rep = torch.maximum(kl_rep_raw, torch.tensor(self.config.free_nats))
+
+        return state, prior, kl_dyn, kl_rep, kl_dyn_raw, kl_rep_raw
 
     def imagine(
         self, prev_action: torch.Tensor, prev_state: Dict[str, torch.Tensor]
@@ -587,20 +600,16 @@ class ReturnNormalizer:
         with torch.no_grad():
             self.count += 1
             if returns.numel() > 1:
-                abs_returns = torch.abs(returns)
-                percentile_5 = torch.quantile(abs_returns, 0.05)
-                percentile_95 = torch.quantile(abs_returns, 0.95)
+                percentile_5 = torch.quantile(returns, 0.05)
+                percentile_95 = torch.quantile(returns, 0.95)
                 scale = percentile_95 - percentile_5
                 scale = torch.clamp(scale, min=1.0)
-                if self.count > 10:
-                    self.scale = (
-                        self.decay * self.scale + (1 - self.decay) * scale.item()
-                    )
-                else:
-                    self.scale = max(1.0, scale.item())
+
+                self.scale = self.decay * self.scale + (1 - self.decay) * scale.item()
 
     def normalize(self, returns: torch.Tensor) -> torch.Tensor:
-        return returns / max(self.limit, self.scale)
+        scale = max(self.limit, self.scale)
+        return returns / scale
 
 
 class WorldModel(nn.Module):
@@ -628,8 +637,10 @@ class WorldModel(nn.Module):
             initial_state = self.rssm.initial_state(batch_size, obs.device)
 
         states = []
-        priors = []
-        kls = []
+        kl_dyn_list = []
+        dyn_raw_list = []
+        kl_rep_list = []
+        rep_raw_list = []
 
         state = initial_state
         for t in range(seq_len):
@@ -640,15 +651,22 @@ class WorldModel(nn.Module):
             else:
                 prev_action = action[:, t - 1]
 
-            state, prior, kl = self.rssm.observe(obs[:, t], prev_action, state)
+            state, _, kl_dyn, kl_rep, kl_dyn_raw, kl_rep_raw = self.rssm.observe(
+                obs[:, t], prev_action, state
+            )
             states.append(state)
-            priors.append(prior)
-            kls.append(kl)
+            kl_dyn_list.append(kl_dyn)
+            dyn_raw_list.append(kl_dyn_raw)
+            kl_rep_list.append(kl_rep)
+            rep_raw_list.append(kl_rep_raw)
 
         states = {
             k: torch.stack([s[k] for s in states], dim=1) for k in states[0].keys()
         }
-        kls = torch.stack(kls, dim=1)
+        kl_dyns = torch.stack(kl_dyn_list, dim=1)
+        kl_reps = torch.stack(kl_rep_list, dim=1)
+        kl_dyns_raw = torch.stack(dyn_raw_list, dim=1)
+        kl_reps_raw = torch.stack(rep_raw_list, dim=1)
 
         state_seq = {k: v.reshape(-1, *v.shape[2:]) for k, v in states.items()}
         obs_pred, reward_logits, continue_logits = self.decoder(state_seq)
@@ -657,7 +675,16 @@ class WorldModel(nn.Module):
         reward_logits = reward_logits.reshape(batch_size, seq_len, -1)
         continue_logits = continue_logits.reshape(batch_size, seq_len, -1)
 
-        return states, obs_pred, reward_logits, continue_logits, kls
+        return (
+            states,
+            obs_pred,
+            reward_logits,
+            continue_logits,
+            kl_dyns,
+            kl_reps,
+            kl_dyns_raw,
+            kl_reps_raw,
+        )
 
 
 class ReplayBuffer:
@@ -720,7 +747,7 @@ class ReplayBuffer:
         return self.capacity if self.full else self.idx
 
 
-class DreamerAgent:
+class DreamerV3:
     def __init__(
         self,
         obs_shape: Tuple[int, ...],
@@ -917,9 +944,16 @@ class DreamerAgent:
         reward = batch["reward"]
         done = batch["done"]
 
-        states, obs_pred, reward_logits, continue_logits, kls = self.world_model(
-            obs, action
-        )
+        (
+            _,
+            obs_pred,
+            reward_logits,
+            continue_logits,
+            kl_dyns,
+            kl_reps,
+            kl_dyns_raw,
+            kl_reps_raw,
+        ) = self.world_model(obs, action)
 
         obs_loss = F.mse_loss(
             obs_pred, obs.reshape(obs.shape[0], obs.shape[1], -1), reduction="mean"
@@ -939,16 +973,11 @@ class DreamerAgent:
             continue_logits.squeeze(-1), 1 - done, reduction="mean"
         )
 
-        kl_free = torch.maximum(
-            kls, torch.tensor(self.config.free_nats, device=kls.device)
-        )
-        kl_loss = kl_free.mean()
-
+        dynamics_loss = self.config.dyn_weight * kl_dyns.mean()
+        representation_loss = self.config.rep_weight * kl_reps.mean()
         prediction_loss = self.config.pred_weight * (
             obs_loss + reward_loss + continue_loss
         )
-        dynamics_loss = self.config.dyn_weight * kl_loss
-        representation_loss = self.config.rep_weight * kl_loss
 
         loss = prediction_loss + dynamics_loss + representation_loss
 
@@ -989,9 +1018,10 @@ class DreamerAgent:
             "world/obs_loss": obs_loss.item(),
             "world/reward_loss": reward_loss.item(),
             "world/continue_loss": continue_loss.item(),
-            "world/kl_loss": kl_loss.item(),
-            "world/kl_mean": kls.mean().item(),
-            "world/kl_max": kls.max().item(),
+            "world/kl_dyn": kl_dyns.mean().item(),
+            "world/kl_rep": kl_reps.mean().item(),
+            "world/kl_dyn_raw": kl_dyns_raw.mean().item(),
+            "world/kl_rep_raw": kl_reps_raw.mean().item(),
             "world/reward_error": reward_error.item(),
             "world/continue_accuracy": continue_acc.item(),
             "world/obs_error": obs_error.item(),
@@ -1115,7 +1145,9 @@ class DreamerAgent:
 
         replay_loss = 0
 
-        replay_states, _, _, _, _ = self.world_model(batch["obs"], batch["action"])
+        replay_states, _, _, _, _, _, _, _ = self.world_model(
+            batch["obs"], batch["action"]
+        )
 
         num_replay_batches = min(self.config.sequence_length // 4, 8)
 
@@ -1394,7 +1426,7 @@ class DreamerAgent:
 
 def train_dreamer(
     env_name: str, total_steps: int = 1000000
-) -> Tuple[DreamerAgent, List[float]]:
+) -> Tuple[DreamerV3, List[float]]:
     env = gym.make(env_name, render_mode=None)
 
     obs_shape = env.observation_space.shape
@@ -1409,7 +1441,14 @@ def train_dreamer(
 
     config = Config()
 
-    agent = DreamerAgent(obs_shape, action_dim, config, discrete)
+    if "Atari" in env_name or "ALE" in env_name:
+        config.action_repeat = 4
+    elif "CarRacing" in env_name:
+        config.action_repeat = 2
+    else:
+        config.action_repeat = 1
+
+    agent = DreamerV3(obs_shape, action_dim, config, discrete)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     os.makedirs("runs", exist_ok=True)
@@ -1434,7 +1473,7 @@ def train_dreamer(
     print(
         f"  Learning rates: model={config.model_lr}, actor={config.actor_lr}, critic={config.critic_lr}"
     )
-    print(f"  Replay ratio: {config.replay_ratio}")
+    print(f"  Replay ratio: {config.replay_ratio}\n")
 
     episode_rewards = []
     episode_count = 0
@@ -1442,19 +1481,12 @@ def train_dreamer(
     update_count = 0
     best_reward = -float("inf")
 
-    warmup_steps = config.batch_size * config.sequence_length * 10
+    warmup_steps = config.batch_size * config.sequence_length
 
     spinner = spinning_cursor()
     start_time = time.time()
 
     os.makedirs("models", exist_ok=True)
-
-    current_episode = {
-        "obs": [],
-        "action": [],
-        "reward": [],
-        "done": [],
-    }
 
     obs, _ = env.reset()
     state = None
@@ -1480,9 +1512,7 @@ def train_dreamer(
 
         if (
             total_env_steps > warmup_steps
-            and total_env_steps
-            % (config.batch_size * config.sequence_length // config.replay_ratio)
-            == 0
+            and total_env_steps % config.replay_ratio == 0
         ):
             metrics = agent.train()
             update_count += 1
@@ -1490,7 +1520,7 @@ def train_dreamer(
             for key, value in metrics.items():
                 writer.add_scalar(f"train/{key}", value, total_env_steps)
 
-            if update_count % 50 == 0:
+            if update_count % 100 == 0:
                 elapsed = time.time() - start_time
                 steps_per_sec = total_env_steps / elapsed
                 eta = (
@@ -1499,7 +1529,7 @@ def train_dreamer(
                     else 0
                 )
 
-                separator = colored("━" * 80, Colors.DIM)
+                separator = colored("━" * 85, Colors.DIM)
                 print(f"\n{separator}")
 
                 env_header = colored(f"[{env_name}]", Colors.HEADER)
@@ -1520,25 +1550,44 @@ def train_dreamer(
                 )
 
                 world_loss = metrics.get("world/total_loss", 0)
-                world_kl = metrics.get("world/kl_mean", 0)
+                world_kl_dyn = metrics.get("world/kl_dyn", 0)
+                kl_dyn_raw = metrics.get("world/kl_dyn_raw", 0)
+                world_kl_rep = metrics.get("world/kl_rep", 0)
+                kl_rep_raw = metrics.get("world/kl_rep_raw", 0)
                 critic_loss = metrics.get("critic/loss", 0)
                 actor_loss = metrics.get("actor/loss", 0)
                 actor_entropy = metrics.get("actor/entropy", 0)
+                reward_error = metrics.get("world/reward_error", 0)
+                obs_error = metrics.get("world/obs_error", 0)
 
                 losses_header = colored("🧠 Losses:", Colors.BLUE)
                 world_loss_str = colored(f"{world_loss:.4f}", Colors.CYAN)
-                world_kl_str = colored(f"{world_kl:.4f}", Colors.CYAN)
+                world_kl_dyn_str = colored(f"{world_kl_dyn:.4f}", Colors.CYAN)
+                world_kl_rep_str = colored(f"{world_kl_rep:.4f}", Colors.CYAN)
+                raw_kl_dyn_str = colored(f"{kl_dyn_raw:.4f}", Colors.CYAN)
+                raw_kl_rep_str = colored(f"{kl_rep_raw:.4f}", Colors.CYAN)
                 critic_loss_str = colored(f"{critic_loss:.4f}", Colors.CYAN)
                 actor_loss_str = colored(f"{actor_loss:.4f}", Colors.CYAN)
                 actor_entropy_str = colored(f"{actor_entropy:.4f}", Colors.CYAN)
+                spacing_str = "           "
+
+                pred_header = colored("🔮 Prediction:", Colors.BLUE)
+                reward_error_str = colored(f"{reward_error:.4f}", Colors.CYAN)
+                obs_error_str = colored(f"{obs_error:.4f}", Colors.CYAN)
 
                 print(
-                    f"\n{losses_header} "
+                    f"{losses_header} "
                     f"World: {world_loss_str}, "
-                    f"KL: {world_kl_str}, "
-                    f"Critic: {critic_loss_str}, "
+                    f"KL(dyn): {world_kl_dyn_str} (raw: {raw_kl_dyn_str}), "
+                    f"KL(rep): {world_kl_rep_str} (raw: {raw_kl_rep_str})\n"
+                    f"{spacing_str}Critic: {critic_loss_str}, "
                     f"Actor: {actor_loss_str}, "
                     f"Entropy: {actor_entropy_str}"
+                )
+                print(
+                    f"{pred_header} "
+                    f"Reward error: {reward_error_str}, "
+                    f"Obs error: {obs_error_str}"
                 )
 
                 if episode_rewards:
@@ -1562,7 +1611,7 @@ def train_dreamer(
 
             writer.add_scalar("episode/reward", episode_reward, episode_count)
 
-            if episode_count > 100 and episode_reward > best_reward:
+            if total_env_steps > warmup_steps and episode_reward > best_reward:
                 best_reward = episode_reward
                 best_model_path = f"models/dreamer_v3_{env_name_safe}_best.pt"
                 torch.save(
@@ -1570,9 +1619,6 @@ def train_dreamer(
                         "world_model": agent.world_model.state_dict(),
                         "actor": agent.actor.state_dict(),
                         "critic": agent.critic.state_dict(),
-                        "config": agent.config,
-                        "episode": episode_count,
-                        "reward": episode_reward,
                     },
                     best_model_path,
                 )
@@ -1610,7 +1656,7 @@ def train_dreamer(
     return agent, episode_rewards
 
 
-def evaluate_and_save_gif(agent: DreamerAgent, env_name: str, num_episodes: int = 5):
+def evaluate_and_save_gif(agent: DreamerV3, env_name: str, num_episodes: int = 5):
     env = gym.make(env_name, render_mode="rgb_array")
 
     best_reward = -float("inf")
@@ -1688,7 +1734,7 @@ def main():
 
     for env_name in environments:
         try:
-            separator = "=" * 80
+            separator = "=" * 85
             header_msg = colored(f"🚀 Training Dreamer-v3 on {env_name}", Colors.HEADER)
 
             print(f"\n{separator}")
@@ -1708,7 +1754,7 @@ def main():
                 agent.world_model.load_state_dict(checkpoint["world_model"])
                 agent.actor.load_state_dict(checkpoint["actor"])
                 agent.critic.load_state_dict(checkpoint["critic"])
-                load_msg = colored("📂 Loaded best model for evaluation", Colors.GREEN)
+                load_msg = colored("📂 Loaded best model for evaluation", Colors.HEADER)
                 best_ep = checkpoint.get("episode", "unknown")
                 best_reward = checkpoint.get("reward", "unknown")
                 print(f"\n{load_msg}")
@@ -1728,12 +1774,10 @@ def main():
         except Exception as e:
             error_msg = colored(f"❌ Error training on {env_name}:", Colors.RED)
             print(f"\n{error_msg} {e}")
-            import traceback
-
             traceback.print_exc()
-            continue
+            exit()
 
-    separator = "=" * 80
+    separator = "=" * 85
     final_header = colored("✅ TRAINING COMPLETE - FINAL SUMMARY", Colors.HEADER)
 
     print(f"\n{separator}")
@@ -1741,13 +1785,13 @@ def main():
     print(f"{separator}")
 
     for env_name, res in results.items():
-        env_colored = colored(env_name, Colors.BLUE)
+        env_colored = colored(env_name, Colors.MAGENTA)
         train_time_mins = res["train_time"] / 60
         final_avg = res["final_avg_reward"]
         final_avg_str = colored(f"{final_avg:.2f}", Colors.GREEN)
         eval_mean = np.mean(res["eval_rewards"])
         eval_std = np.std(res["eval_rewards"])
-        eval_mean_str = colored(f"{eval_mean:.2f}", Colors.CYAN)
+        eval_mean_str = colored(f"{eval_mean:.2f}", Colors.GREEN)
         num_episodes = len(res["train_rewards"])
 
         print(f"\n{env_colored}:")
