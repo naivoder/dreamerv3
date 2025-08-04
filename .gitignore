@@ -12,7 +12,7 @@ videos/
 gifs/
 models/
 *.csv
-
+dreamerv3_implementation_details.txt
 old.py
 
 # Byte-compiled / optimized / DLL files
