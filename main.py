@@ -64,8 +64,8 @@ def spinning_cursor():
 class Config:
     batch_size: int = 16
     sequence_length: int = 64
-    replay_ratio: int = 128
-    buffer_size: int = 1_000_000
+    replay_ratio: int = 32
+    buffer_size: int = 2_000_000
     deter_size: int = 1024
     stoch_size: int = 16
     stoch_discrete: int = 16
@@ -1635,7 +1635,7 @@ def train_dreamer(
     env.close()
     writer.close()
 
-    complete_msg = colored("✅ Training Complete!", Colors.GREEN)
+    complete_msg = colored("✅ Training Complete!", Colors.HEADER)
     time_elapsed = (time.time() - start_time) / 60
     time_str = colored(f"{time_elapsed:.1f} minutes", Colors.CYAN)
 
@@ -1684,11 +1684,11 @@ def evaluate_and_save_gif(agent: DreamerV3, env_name: str, num_episodes: int = 5
 
     env.close()
 
-    summary_header = colored("📊 Evaluation Summary:", Colors.GREEN)
-    best_str = colored(f"{best_reward:.2f}", Colors.BOLD)
+    summary_header = colored("📊 Evaluation Summary:", Colors.HEADER)
+    best_str = colored(f"{best_reward:.2f}", Colors.GREEN)
     mean_reward = np.mean(episode_rewards)
     std_reward = np.std(episode_rewards)
-    mean_str = colored(f"{mean_reward:.2f}", Colors.CYAN)
+    mean_str = colored(f"{mean_reward:.2f}", Colors.GREEN)
     min_reward = np.min(episode_rewards)
     max_reward = np.max(episode_rewards)
 
@@ -1702,7 +1702,7 @@ def evaluate_and_save_gif(agent: DreamerV3, env_name: str, num_episodes: int = 5
         env_name_safe = env_name.replace("/", "_")
         gif_filename = f"gifs/dreamer_v3_{env_name_safe}.gif"
         imageio.mimsave(gif_filename, best_frames, fps=30)
-        gif_msg = colored(gif_filename, Colors.GREEN)
+        gif_msg = colored(gif_filename, Colors.HEADER)
         print(f"  Saved GIF: {gif_msg}")
 
     return episode_rewards
