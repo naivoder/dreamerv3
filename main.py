@@ -1691,10 +1691,10 @@ class DreamerV3:
             scale = max(self.config.return_norm_limit, self.return_normalizer.scale)
             advantages = (returns - all_values) / scale
 
-            adv_mean = advantages.mean()
-            adv_std = advantages.std() + 1e-8
-            advantages = (advantages - adv_mean) / adv_std
-            advantages = advantages.clamp(-10.0, 10.0)
+            # adv_mean = advantages.mean()
+            # adv_std = advantages.std() + 1e-8
+            # advantages = (advantages - adv_mean) / adv_std
+            # advantages = advantages.clamp(-10.0, 10.0)
 
         total_pg_loss = 0
         total_entropy = 0
@@ -1927,8 +1927,10 @@ def train_dreamer(
                 world_kl_rep = metrics.get("world/kl_rep", 0)
                 kl_rep_raw = metrics.get("world/kl_rep_raw", 0)
                 critic_loss = metrics.get("critic/loss", 0)
+                critic_scale = metrics.get("critic/return_scale", 0)
                 actor_loss = metrics.get("actor/loss", 0)
                 actor_entropy = metrics.get("actor/entropy", 0)
+                actor_adv = metrics.get("actor/mean_advantage", 0)
                 reward_error = metrics.get("world/reward_error", 0)
                 obs_error = metrics.get("world/obs_error", 0)
 
@@ -1939,8 +1941,10 @@ def train_dreamer(
                 raw_kl_dyn_str = colored(f"{kl_dyn_raw:.4f}", Colors.CYAN)
                 raw_kl_rep_str = colored(f"{kl_rep_raw:.4f}", Colors.CYAN)
                 critic_loss_str = colored(f"{critic_loss:.4f}", Colors.CYAN)
+                critic_scale_str = colored(f"{critic_scale:.4f}", Colors.CYAN)
                 actor_loss_str = colored(f"{actor_loss:.4f}", Colors.CYAN)
                 actor_entropy_str = colored(f"{actor_entropy:.4f}", Colors.CYAN)
+                actor_adv_str = colored(f"{actor_adv:.4f}", Colors.CYAN)
                 spacing_str = "           "
 
                 pred_header = colored("🔮 Prediction:", Colors.BLUE)
@@ -1952,8 +1956,8 @@ def train_dreamer(
                     f"World: {world_loss_str}, "
                     f"KL(dyn): {world_kl_dyn_str} (raw: {raw_kl_dyn_str}), "
                     f"KL(rep): {world_kl_rep_str} (raw: {raw_kl_rep_str})\n"
-                    f"{spacing_str}Critic: {critic_loss_str}, "
-                    f"Actor: {actor_loss_str}, "
+                    f"{spacing_str}Critic: {critic_loss_str} (scale: {critic_scale_str}), "
+                    f"Actor: {actor_loss_str} (advantage: {actor_adv_str}), "
                     f"Entropy: {actor_entropy_str}"
                 )
                 print(
@@ -2115,7 +2119,7 @@ def evaluate_and_save_gif(agent: DreamerV3, env_name: str, num_episodes: int = 5
 def main():
     environments = [
         # "CartPole-v1",
-        "Pendulum-v1",
+        # "Pendulum-v1",
         "BipedalWalker-v3",
         "LunarLander-v3",
         "CarRacing-v3",
