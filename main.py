@@ -64,7 +64,7 @@ def spinning_cursor():
 class Config:
     batch_size: int = 16
     sequence_length: int = 64
-    replay_ratio: int = 32
+    replay_ratio: int = 128
     buffer_size: int = 5_000_000
     deter_size: int = 1024
     stoch_size: int = 16
@@ -73,9 +73,7 @@ class Config:
     cnn_depth: int = 48
     cnn_kernels: List[int] = (4, 4, 4, 4)
     cnn_strides: List[int] = (2, 2, 2, 2)
-    model_lr: float = 4e-5
-    actor_lr: float = 4e-5
-    critic_lr: float = 3e-4
+    learning_rate: float = 4e-5
     free_nats: float = 1.0
     pred_weight: float = 1.0
     dyn_weight: float = 1.0
@@ -154,11 +152,9 @@ def twohot_decode_jit(
 ) -> torch.Tensor:
     bin_centers = torch.linspace(min_val, max_val, bins, device=twohot.device)
 
-    # Pre-compute masks
     positive_mask = bin_centers >= 0
     negative_mask = ~positive_mask
 
-    # Vectorized computation
     value_symlog = (twohot * bin_centers).sum(dim=-1)
     return symexp(value_symlog)
 
@@ -201,7 +197,6 @@ class LaProp(torch.optim.Optimizer):
                 v, m = state["v"], state["m"]
                 state["step"] += 1
 
-                # In-place operations
                 v.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
                 normalized_grad = grad / (v.sqrt() + eps)
                 m.mul_(beta1).add_(normalized_grad, alpha=1 - beta1)
@@ -293,7 +288,6 @@ class BlockGRU(nn.Module):
 
         self.input_proj = nn.Linear(input_size + hidden_size, 3 * hidden_size)
 
-        # Fused block weights for better memory access
         self.block_weights = nn.Parameter(
             torch.zeros(num_blocks, self.block_size, 3 * self.block_size)
         )
@@ -312,13 +306,11 @@ class BlockGRU(nn.Module):
     def forward(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
         batch_size = x.shape[0]
 
-        # Single projection for all gates
         input_gates = self.input_proj(torch.cat([x, h], dim=-1))
         input_gates = input_gates.view(batch_size, self.num_blocks, 3 * self.block_size)
 
         h_blocks = h.view(batch_size, self.num_blocks, self.block_size)
 
-        # Vectorized block computation
         block_gates = torch.bmm(
             h_blocks.reshape(-1, 1, self.block_size),
             self.block_weights.repeat(batch_size, 1, 1),
@@ -326,13 +318,11 @@ class BlockGRU(nn.Module):
         block_gates = block_gates.view(batch_size, self.num_blocks, -1)
         block_gates = input_gates + block_gates + self.block_biases
 
-        # Split and compute GRU operations
         r, z, n = block_gates.chunk(3, dim=-1)
         r = torch.sigmoid(r)
         z = torch.sigmoid(z)
         n = torch.tanh(n)
 
-        # Update hidden state
         new_h = (1 - z) * n + z * h_blocks
 
         return new_h.reshape(batch_size, self.hidden_size)
@@ -378,6 +368,8 @@ class CNNEncoder(nn.Module):
         )
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        obs = obs / 255.0 if obs.max() > 1.0 else obs
+
         if len(obs.shape) == 3:
             obs = obs.unsqueeze(1)
         elif len(obs.shape) == 4:
@@ -499,21 +491,21 @@ class RSSM(nn.Module):
 
         batch_size = prior_logits.shape[0]
 
-        prior_logits_flat = prior_logits.reshape(-1, self.config.stoch_discrete)
-        posterior_logits_flat = posterior_logits.reshape(-1, self.config.stoch_discrete)
+        prior_no_grad = OneHotDist(
+            logits=prior_logits.detach(), unimix=self.config.unimix
+        )
+        posterior_no_grad = OneHotDist(
+            logits=posterior_logits.detach(), unimix=self.config.unimix
+        )
 
-        prior_dist = D.Categorical(logits=prior_logits_flat)
-        posterior_dist = D.Categorical(logits=posterior_logits_flat)
+        prior_independent = D.Independent(prior.cat, 1)
+        prior_no_grad_independent = D.Independent(prior_no_grad.cat, 1)
+        posterior_independent = D.Independent(posterior.cat, 1)
+        posterior_no_grad_independent = D.Independent(posterior_no_grad.cat, 1)
 
-        prior_dist_no_grad = D.Categorical(logits=prior_logits_flat)
-        posterior_dist_detached = D.Categorical(logits=posterior_logits_flat.detach())
-        kl_dyn_flat = D.kl_divergence(prior_dist_no_grad, posterior_dist_detached)
-        kl_dyn_raw = kl_dyn_flat.reshape(batch_size, self.config.stoch_size).sum(dim=-1)
+        kl_dyn_raw = D.kl_divergence(posterior_no_grad_independent, prior_independent)
 
-        posterior_dist_no_grad = D.Categorical(logits=posterior_logits_flat)
-        prior_dist_detached = D.Categorical(logits=prior_logits_flat.detach())
-        kl_rep_flat = D.kl_divergence(posterior_dist_no_grad, prior_dist_detached)
-        kl_rep_raw = kl_rep_flat.reshape(batch_size, self.config.stoch_size).sum(dim=-1)
+        kl_rep_raw = D.kl_divergence(posterior_independent, prior_no_grad_independent)
 
         kl_dyn = torch.maximum(kl_dyn_raw, torch.tensor(self.config.free_nats))
         kl_rep = torch.maximum(kl_rep_raw, torch.tensor(self.config.free_nats))
@@ -634,13 +626,14 @@ class CNNDecoder(nn.Module):
             nn.ConvTranspose2d(config.cnn_depth * 2, config.cnn_depth, 4, 2, 1),
             nn.SiLU(inplace=True),
             nn.ConvTranspose2d(config.cnn_depth, out_channels, 4, 2, 1),
+            nn.Sigmoid(),
         )
 
         self.output_resize = nn.AdaptiveAvgPool2d((obs_shape[0], obs_shape[1]))
 
     def forward(self, feat: torch.Tensor) -> torch.Tensor:
         x = self.fc(feat)
-        x = x.view(x.shape[0], -1, 4, 4)
+        x = x.reshape(x.shape[0], -1, 4, 4)
         x = self.deconv(x)
         x = self.output_resize(x)
 
@@ -650,16 +643,23 @@ class CNNDecoder(nn.Module):
             x = x.squeeze(1)
 
         batch_size = x.shape[0]
-        return x.view(batch_size, -1)
+        return x.reshape(batch_size, -1)
 
 
 class Actor(nn.Module):
     def __init__(
-        self, state_dim: int, action_dim: int, config: Config, discrete: bool = False
+        self,
+        state_dim: int,
+        action_dim: int,
+        config: Config,
+        discrete: bool = False,
+        action_low: Optional[np.ndarray] = None,
+        action_high: Optional[np.ndarray] = None,
     ):
         super().__init__()
         self.config = config
         self.discrete = discrete
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.net = nn.Sequential(
             nn.Linear(state_dim, config.hidden_size),
@@ -673,8 +673,35 @@ class Actor(nn.Module):
         if discrete:
             self.head = nn.Linear(config.hidden_size, action_dim)
         else:
-            self.mean_head = nn.Linear(config.hidden_size, action_dim)
-            self.std_head = nn.Linear(config.hidden_size, action_dim)
+            # Output both mean and log_std
+            self.head = nn.Linear(config.hidden_size, action_dim * 2)
+
+            # Register action bounds for continuous actions
+            if action_low is not None and action_high is not None:
+                self.register_buffer(
+                    "action_scale",
+                    torch.tensor(
+                        (action_high - action_low) / 2.0,
+                        device=self.device,
+                        dtype=torch.float32,
+                    ),
+                )
+                self.register_buffer(
+                    "action_bias",
+                    torch.tensor(
+                        (action_high + action_low) / 2.0,
+                        device=self.device,
+                        dtype=torch.float32,
+                    ),
+                )
+            else:
+                # Default to [-1, 1] if bounds not provided
+                self.register_buffer(
+                    "action_scale", torch.ones(action_dim, device=self.device)
+                )
+                self.register_buffer(
+                    "action_bias", torch.zeros(action_dim, device=self.device)
+                )
 
         self.apply(self._init_weights)
 
@@ -682,26 +709,66 @@ class Actor(nn.Module):
         if isinstance(module, nn.Linear):
             if hasattr(self, "head") and module is self.head:
                 nn.init.xavier_uniform_(module.weight, gain=0.01)
-            elif hasattr(self, "mean_head") and (
-                module is self.mean_head or module is self.std_head
-            ):
-                nn.init.xavier_uniform_(module.weight, gain=0.01)
             else:
                 nn.init.xavier_normal_(module.weight, gain=1.0)
 
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
-    def forward(self, feat: torch.Tensor) -> D.Distribution:
+    def forward(self, feat: torch.Tensor, training: bool = False):
         h = self.net(feat)
 
         if self.discrete:
             logits = self.head(h)
-            return OneHotDist(logits=logits, unimix=self.config.unimix)
+            dist = OneHotDist(logits=logits, unimix=self.config.unimix)
+            if training:
+                action = dist.rsample()
+                log_prob = dist.log_prob(action)
+                entropy = dist.entropy()
+                # For discrete, convert one-hot back to indices
+                action_indices = torch.argmax(action, dim=-1)
+                return action_indices, log_prob, entropy
+            else:
+                # Return mode (most likely action)
+                return torch.argmax(dist.mode, dim=-1)
         else:
-            mean = self.mean_head(h)
-            std = F.softplus(self.std_head(h) - 5) + 0.1
-            return D.Normal(mean, std)
+            # Continuous actions
+            output = self.head(h)
+            mean, log_std = output.chunk(2, dim=-1)
+
+            # Constrain log_std to reasonable range using tanh
+            log_std_min, log_std_max = -5.0, 2.0
+            log_std = log_std_min + (log_std_max - log_std_min) / 2 * (
+                torch.tanh(log_std) + 1
+            )
+            std = torch.exp(log_std)
+
+            # Create normal distribution
+            distribution = D.Normal(mean, std)
+
+            if training:
+                # Sample action
+                sample = distribution.rsample()
+                sample_tanh = torch.tanh(sample)
+                action = sample_tanh * self.action_scale + self.action_bias
+
+                # Compute log probability with correction for tanh squashing
+                log_prob = distribution.log_prob(sample)
+                # Correction term: -log|det(d(tanh)/dx)| = -log(1 - tanh^2(x))
+                log_prob -= torch.log(
+                    self.action_scale * (1 - sample_tanh.pow(2)) + 1e-6
+                )
+                log_prob = log_prob.sum(dim=-1)  # Sum over action dimensions
+
+                # Entropy
+                entropy = distribution.entropy().sum(dim=-1)
+
+                return action, log_prob, entropy
+            else:
+                # For evaluation, use mean action
+                mean_tanh = torch.tanh(mean)
+                action = mean_tanh * self.action_scale + self.action_bias
+                return action
 
 
 class Critic(nn.Module):
@@ -737,27 +804,53 @@ class Critic(nn.Module):
         return self.net(feat)
 
 
-class ReturnNormalizer:
-    def __init__(self, decay: float = 0.99, limit: float = 1.0):
+class ReturnNormalizer(nn.Module):
+    def __init__(
+        self, device, decay=0.99, limit=1.0, percentile_low=0.05, percentile_high=0.95
+    ):
+        super().__init__()
         self.decay = decay
         self.limit = limit
-        self.scale = 1.0
-        self.count = 0
+        self.percentile_low = percentile_low
+        self.percentile_high = percentile_high
 
-    def update(self, returns: torch.Tensor):
+        self.register_buffer("low", torch.zeros((), dtype=torch.float32, device=device))
+        self.register_buffer(
+            "high", torch.zeros((), dtype=torch.float32, device=device)
+        )
+        self.register_buffer(
+            "scale", torch.ones((), dtype=torch.float32, device=device)
+        )
+
+    def update(self, values: torch.Tensor):
+        """Update running statistics with new values."""
         with torch.no_grad():
-            self.count += 1
-            if returns.numel() > 1:
-                percentile_5 = torch.quantile(returns, 0.05)
-                percentile_95 = torch.quantile(returns, 0.95)
-                scale = percentile_95 - percentile_5
-                scale = torch.clamp(scale, min=1.0)
+            values = values.detach().flatten()
 
-                self.scale = self.decay * self.scale + (1 - self.decay) * scale.item()
+            if values.numel() > 1:
+                low = torch.quantile(values, self.percentile_low)
+                high = torch.quantile(values, self.percentile_high)
 
-    def normalize(self, returns: torch.Tensor) -> torch.Tensor:
-        scale = max(self.limit, self.scale)
-        return returns / scale
+                self.low = self.decay * self.low + (1 - self.decay) * low
+                self.high = self.decay * self.high + (1 - self.decay) * high
+
+                self.scale = torch.max(
+                    torch.tensor(self.limit, device=values.device), self.high - self.low
+                )
+
+    def normalize(self, values: torch.Tensor) -> torch.Tensor:
+        # Center around the midpoint and scale
+        # This is more robust than dividing by scale alone
+        center = (self.high + self.low) / 2
+        return (values - center) / self.scale
+
+    def denormalize(self, normalized_values: torch.Tensor) -> torch.Tensor:
+        center = (self.high + self.low) / 2
+        return normalized_values * self.scale + center
+
+    @property
+    def inverse_scale(self):
+        return self.scale
 
 
 class WorldModel(nn.Module):
@@ -837,7 +930,7 @@ class WorldModel(nn.Module):
 
 class ParallelReplayBuffer:
     def __init__(self, capacity: int, num_envs: int):
-        self.capacity = capacity // num_envs  # Capacity per env
+        self.capacity = capacity // num_envs
         self.num_envs = num_envs
         self.data = {
             "obs": np.zeros((num_envs, self.capacity), dtype=object),
@@ -858,7 +951,6 @@ class ParallelReplayBuffer:
         done: np.ndarray,
         state: List[Dict[str, np.ndarray]],
     ):
-        # obs, action, reward, done: shape (num_envs, ...)
         for i in range(self.num_envs):
             idx = self.idx[i]
             self.data["obs"][i, idx] = obs[i]
@@ -918,7 +1010,6 @@ class ParallelReplayBuffer:
         }
         indices = []
 
-        # Sample from online queue
         if online_batch_size > 0:
             valid_envs = [
                 i for i in range(self.num_envs) if len(self.online_queue[i]) >= seq_len
@@ -937,7 +1028,6 @@ class ParallelReplayBuffer:
                         batch["state"].append(state_seq)
                         indices.append((-1, -1))
 
-        # Sample from replay buffer
         for _ in range(replay_batch_size):
             env_idx = random.randint(0, self.num_envs - 1)
             max_idx = self.capacity if self.full[env_idx] else self.idx[env_idx]
@@ -966,7 +1056,6 @@ class ParallelReplayBuffer:
                 batch["state"].append(self.data["state"][env_idx, start])
                 indices.append((env_idx, start))
 
-        # Convert to tensors
         for key in ["obs", "action", "reward", "done"]:
             if batch[key]:
                 batch[key] = torch.FloatTensor(np.stack(batch[key]))
@@ -986,11 +1075,15 @@ class DreamerV3:
         action_dim: int,
         config: Config,
         discrete: bool = False,
+        action_low: Optional[np.ndarray] = None,
+        action_high: Optional[np.ndarray] = None,
     ):
         self.config = config
         self.discrete = discrete
         self.obs_shape = obs_shape
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.action_low = action_low
+        self.action_high = action_high
 
         self.world_model = WorldModel(obs_shape, action_dim, config).to(self.device)
         self.actor = Actor(
@@ -998,6 +1091,16 @@ class DreamerV3:
             action_dim,
             config,
             discrete,
+            (
+                torch.tensor(action_low, device=self.device)
+                if action_low is not None
+                else None
+            ),
+            (
+                torch.tensor(action_high, device=self.device)
+                if action_high is not None
+                else None
+            ),
         ).to(self.device)
         self.critic = Critic(
             config.deter_size + config.stoch_size * config.stoch_discrete, config
@@ -1011,36 +1114,28 @@ class DreamerV3:
         for param in self.target_critic.parameters():
             param.requires_grad = False
 
-        # # Compile models for better performance
-        # if hasattr(torch, "compile"):
-        #     self.world_model = torch.compile(
-        #         self.world_model, mode="max-autotune", fullgraph=False
-        #     )
-        #     self.actor = torch.compile(self.actor, mode="max-autotune", fullgraph=False)
-        #     self.critic = torch.compile(
-        #         self.critic, mode="max-autotune", fullgraph=False
-        #     )
-
         self.world_opt = LaProp(
             self.world_model.parameters(),
-            lr=config.model_lr,
+            lr=config.learning_rate,
             eps=config.laprop_eps,
         )
         self.actor_opt = LaProp(
             self.actor.parameters(),
-            lr=config.actor_lr,
+            lr=config.learning_rate,
             eps=config.laprop_eps,
         )
         self.critic_opt = LaProp(
             self.critic.parameters(),
-            lr=config.critic_lr,
+            lr=config.learning_rate,
             eps=config.laprop_eps,
         )
 
         self.replay_buffer = ParallelReplayBuffer(config.buffer_size, config.num_envs)
 
         self.return_normalizer = ReturnNormalizer(
-            decay=config.return_norm_decay, limit=config.return_norm_limit
+            decay=config.return_norm_decay,
+            limit=config.return_norm_limit,
+            device=self.device,
         )
 
         self.train_steps = 0
@@ -1065,7 +1160,6 @@ class DreamerV3:
             num_envs = obs.shape[0]
             obs_t = self.process_observation(obs)
 
-            # Initialize states if needed
             if states is None:
                 states = [None] * num_envs
 
@@ -1073,10 +1167,8 @@ class DreamerV3:
             for i in range(num_envs):
                 if states[i] is None:
                     initial = self.world_model.rssm.initial_state(1, self.device)
-                    # Keep batch dimension for consistency
                     batch_states.append({k: v for k, v in initial.items()})
                 else:
-                    # Ensure states have batch dimension
                     state_dict = {}
                     for k, v in states[i].items():
                         if v.dim() == 1:
@@ -1085,15 +1177,12 @@ class DreamerV3:
                             state_dict[k] = v
                     batch_states.append(state_dict)
 
-            # Stack states for batch processing - all have shape [1, ...]
             batch_deter = torch.cat([s["deter"] for s in batch_states], dim=0)
             batch_stoch = torch.cat([s["stoch"] for s in batch_states], dim=0)
             batch_state = {"deter": batch_deter, "stoch": batch_stoch}
 
-            # Encode observations
             embed = self.world_model.rssm.encoder(obs_t)
 
-            # Get previous actions
             prev_actions = []
             for i in range(num_envs):
                 if self.prev_actions[i] is None:
@@ -1102,9 +1191,9 @@ class DreamerV3:
                             self.device
                         )
                     else:
-                        prev_action = torch.zeros(
-                            1, self.actor.mean_head.out_features
-                        ).to(self.device)
+                        # For continuous actions, the action dim is head.out_features // 2
+                        action_dim = self.actor.head.out_features // 2
+                        prev_action = torch.zeros(1, action_dim).to(self.device)
                 else:
                     prev_action = (
                         torch.FloatTensor(self.prev_actions[i])
@@ -1115,7 +1204,6 @@ class DreamerV3:
 
             prev_actions = torch.stack(prev_actions)
 
-            # Update states
             prev_stoch = batch_state["stoch"].view(num_envs, -1)
             deter = self.world_model.rssm.gru(
                 torch.cat([prev_stoch, prev_actions], dim=-1), batch_state["deter"]
@@ -1132,36 +1220,36 @@ class DreamerV3:
 
             new_states = {"deter": deter, "stoch": stoch}
 
-            # Get actions
             feat = self.world_model.decoder.get_feat(new_states)
-            action_dist = self.actor(feat)
 
+            # Use the new Actor interface
             if training:
-                action_t = action_dist.rsample()
+                if self.discrete:
+                    action_t, _, _ = self.actor(feat, training=True)
+                else:
+                    action_t, _, _ = self.actor(feat, training=True)
             else:
-                action_t = action_dist.mode if self.discrete else action_dist.mean
+                action_t = self.actor(feat, training=False)
 
             actions_np = action_t.cpu().numpy()
 
-            # Update prev_actions and prev_states
             for i in range(num_envs):
                 if self.discrete:
-                    action = np.argmax(actions_np[i])
+                    # For discrete, action_t is already the action index
+                    action = actions_np[i]
                     action_onehot = np.zeros(self.actor.head.out_features)
                     action_onehot[action] = 1.0
                     self.prev_actions[i] = action_onehot
                     actions_np[i] = action
                 else:
-                    self.prev_actions[i] = np.clip(actions_np[i], -1.0, 1.0)
-                    actions_np[i] = self.prev_actions[i]
+                    # For continuous, action is already properly bounded by the Actor
+                    self.prev_actions[i] = actions_np[i]
 
-                # Store without batch dimension
                 self.prev_states[i] = {
                     "deter": deter[i].detach(),
                     "stoch": stoch[i].detach(),
                 }
 
-            # Return list of states with batch dimension
             output_states = []
             for i in range(num_envs):
                 output_states.append(
@@ -1226,7 +1314,6 @@ class DreamerV3:
                 else:
                     all_metrics[k] = v
 
-            # Update target critic
             with torch.no_grad():
                 for param, target_param in zip(
                     self.critic.parameters(), self.target_critic.parameters()
@@ -1237,7 +1324,6 @@ class DreamerV3:
 
             self.train_steps += 1
 
-        # Average metrics
         for k in all_metrics:
             all_metrics[k] /= steps
 
@@ -1265,14 +1351,13 @@ class DreamerV3:
             kl_reps_raw,
         ) = self.world_model(obs, action, initial_state)
 
-        # Use symlog squared error for vector observations
         obs_flat = obs.reshape(obs.shape[0], obs.shape[1], -1)
-        if not self.world_model.rssm.is_image:
-            # For vector obs: 0.5 * (symlog(pred) - symlog(target))^2
-            obs_loss = 0.5 * (symlog(obs_pred) - symlog(obs_flat)).pow(2).mean()
+
+        if self.world_model.rssm.is_image:
+            obs_normalized = obs_flat / 255.0 if obs_flat.max() > 1.0 else obs_flat
+            obs_loss = F.mse_loss(obs_pred, obs_normalized, reduction="mean")
         else:
-            # For image obs: regular MSE
-            obs_loss = F.mse_loss(obs_pred, obs_flat, reduction="mean")
+            obs_loss = 0.5 * (symlog(obs_pred) - symlog(obs_flat)).pow(2).mean()
 
         reward_target = twohot_encode(
             reward,
@@ -1303,7 +1388,6 @@ class DreamerV3:
         )
         self.world_opt.step()
 
-        # Update states in replay buffer
         with torch.no_grad():
             for i, (env_idx, start_idx) in enumerate(indices):
                 if env_idx >= 0:
@@ -1332,11 +1416,11 @@ class DreamerV3:
                 .mean()
             )
 
-            # Fix obs error computation to match the loss
-            if not self.world_model.rssm.is_image:
-                obs_error = 0.5 * (symlog(obs_pred) - symlog(obs_flat)).pow(2).mean()
+            if self.world_model.rssm.is_image:
+                obs_normalized = obs_flat / 255.0 if obs_flat.max() > 1.0 else obs_flat
+                obs_error = F.mse_loss(obs_pred, obs_normalized, reduction="mean")
             else:
-                obs_error = F.mse_loss(obs_pred, obs_flat, reduction="mean")
+                obs_error = 0.5 * (symlog(obs_pred) - symlog(obs_flat)).pow(2).mean()
 
         return {
             "world/total_loss": loss.item(),
@@ -1358,9 +1442,7 @@ class DreamerV3:
     def _train_actor_critic(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
         with torch.no_grad():
             obs = batch["obs"][:, 0]
-            obs = self.process_observation(obs[0]).repeat(obs.shape[0], 1)
-            if len(obs.shape) == 2 and len(self.obs_shape) > 1:
-                obs = obs.reshape(obs.shape[0], *self.obs_shape)
+            obs = self.process_observation(obs.cpu().numpy())
 
             embed = self.world_model.rssm.encoder(obs)
 
@@ -1389,7 +1471,6 @@ class DreamerV3:
         with torch.no_grad():
             state = {k: v.detach() for k, v in initial_state.items()}
 
-            # Pre-allocate tensors for imagination
             batch_size = state["deter"].shape[0]
             horizon = self.config.horizon
 
@@ -1399,8 +1480,7 @@ class DreamerV3:
 
             for t in range(horizon):
                 feat = self.world_model.decoder.get_feat(state)
-                action_dist = self.actor(feat)
-                action = action_dist.rsample()
+                action, _, _ = self.actor(feat, training=True)
 
                 state = self.world_model.rssm.imagine(action, state)
                 all_states.append({k: v.clone() for k, v in state.items()})
@@ -1429,7 +1509,6 @@ class DreamerV3:
                 self.config.twohot_max,
             )
 
-            # Compute values for all states at once
             all_values = []
             for state in all_states:
                 feat = self.world_model.decoder.get_feat(state)
@@ -1453,7 +1532,6 @@ class DreamerV3:
 
             self.return_normalizer.update(returns.flatten())
 
-        # Train critic on imagination
         imagination_loss = 0
 
         for t in range(self.config.horizon):
@@ -1477,7 +1555,6 @@ class DreamerV3:
 
         imagination_loss = imagination_loss / self.config.horizon
 
-        # Train critic on replay
         replay_loss = 0
 
         replay_states, _, _, _, _, _, _, _ = self.world_model(
@@ -1503,8 +1580,7 @@ class DreamerV3:
                     min(self.config.horizon, self.config.sequence_length - t)
                 ):
                     feat = self.world_model.decoder.get_feat(state)
-                    action_dist = self.actor(feat)
-                    action = action_dist.rsample()
+                    action, _, _ = self.actor(feat, training=True)
 
                     state = self.world_model.rssm.imagine(action, state)
                     im_states.append({k: v.clone() for k, v in state.items()})
@@ -1624,20 +1700,22 @@ class DreamerV3:
     def _train_actor(self, initial_state: Dict[str, torch.Tensor]) -> Dict[str, float]:
         states = []
         actions = []
+        log_probs = []
+        entropies = []
 
         state = initial_state
         for _ in range(self.config.horizon):
             states.append(state)
 
             feat = self.world_model.decoder.get_feat(state)
-            action_dist = self.actor(feat)
-            action = action_dist.rsample()
+            action, log_prob, entropy = self.actor(feat, training=True)
             actions.append(action)
+            log_probs.append(log_prob)
+            entropies.append(entropy)
 
             state = self.world_model.rssm.imagine(action, state)
 
         with torch.no_grad():
-            # Vectorized computation of rewards, continues, and values
             batch_size = initial_state["deter"].shape[0]
             horizon = self.config.horizon
 
@@ -1691,29 +1769,13 @@ class DreamerV3:
             scale = max(self.config.return_norm_limit, self.return_normalizer.scale)
             advantages = (returns - all_values) / scale
 
-            # adv_mean = advantages.mean()
-            # adv_std = advantages.std() + 1e-8
-            # advantages = (advantages - adv_mean) / adv_std
-            # advantages = advantages.clamp(-10.0, 10.0)
-
         total_pg_loss = 0
         total_entropy = 0
 
         for t in range(self.config.horizon):
-            feat = self.world_model.decoder.get_feat(states[t])
-            action_dist = self.actor(feat)
-
-            log_prob = action_dist.log_prob(actions[t])
-            if len(log_prob.shape) > 1:
-                log_prob = log_prob.sum(dim=-1)
-
-            pg_loss = -(advantages[:, t].detach() * log_prob).mean()
+            pg_loss = -(advantages[:, t].detach() * log_probs[t]).mean()
             total_pg_loss = total_pg_loss + pg_loss
-
-            entropy = action_dist.entropy()
-            if len(entropy.shape) > 1:
-                entropy = entropy.sum(dim=-1)
-            total_entropy = total_entropy + entropy.mean()
+            total_entropy = total_entropy + entropies[t].mean()
 
         total_pg_loss = total_pg_loss / self.config.horizon
         total_entropy = total_entropy / self.config.horizon
@@ -1781,11 +1843,9 @@ def train_dreamer(
     config = Config()
     config.action_repeat = get_action_repeat(env_name)
 
-    # Create parallel envs
     env_fns = [make_env(env_name) for _ in range(config.num_envs)]
     envs = AsyncVectorEnv(env_fns)
 
-    # Get env info from first env
     single_env = gym.make(env_name)
     obs_shape = single_env.observation_space.shape
     is_image = len(obs_shape) > 1
@@ -1793,13 +1853,17 @@ def train_dreamer(
     if isinstance(single_env.action_space, gym.spaces.Discrete):
         action_dim = single_env.action_space.n
         discrete = True
+        action_low = None
+        action_high = None
     else:
         action_dim = single_env.action_space.shape[0]
         discrete = False
+        action_low = single_env.action_space.low
+        action_high = single_env.action_space.high
 
     single_env.close()
 
-    agent = DreamerV3(obs_shape, action_dim, config, discrete)
+    agent = DreamerV3(obs_shape, action_dim, config, discrete, action_low, action_high)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     os.makedirs("runs", exist_ok=True)
@@ -1820,11 +1884,9 @@ def train_dreamer(
     print(f"  Using {encoder_type} encoder")
     print(f"  Action repeat: {config.action_repeat}")
     print(
-        f"  Model: deter={config.deter_size}, stoch={config.stoch_size}×{config.stoch_discrete}"
+        f"  Model: deter={config.deter_size}, stoch={config.stoch_size}×{config.stoch_discrete}, hidden={config.hidden_size}"
     )
-    print(
-        f"  Learning rates: model={config.model_lr}, actor={config.actor_lr}, critic={config.critic_lr}"
-    )
+    print(f"  Learning rates: {config.learning_rate}")
     print(f"  Replay ratio: {config.replay_ratio}\n")
 
     episode_rewards = [[] for _ in range(config.num_envs)]
@@ -1850,7 +1912,6 @@ def train_dreamer(
     while total_env_steps < total_steps:
         actions, states = agent.act(obs, states, training=True)
 
-        # Handle action repeat
         cum_rewards = np.zeros(config.num_envs)
         dones = np.zeros(config.num_envs, dtype=bool)
 
@@ -1861,7 +1922,6 @@ def train_dreamer(
             if dones.all():
                 break
 
-        # Store transitions
         action_data = []
         state_data = []
         for i in range(config.num_envs):
@@ -1881,7 +1941,6 @@ def train_dreamer(
         obs = next_obs
         total_env_steps += config.num_envs * config.action_repeat
 
-        # Training
         if (
             total_env_steps > warmup_steps
             and total_env_steps % config.replay_ratio == 0
@@ -1984,7 +2043,6 @@ def train_dreamer(
                         f"Last: {last_str}"
                     )
 
-        # Check for done episodes
         for i in range(config.num_envs):
             if dones[i]:
                 episode_rewards[i].append(episode_reward[i])
@@ -2036,7 +2094,6 @@ def train_dreamer(
     print(f"\n{complete_msg}")
     print(f"Total time: {time_str}")
 
-    # Flatten episode rewards for compatibility
     all_rewards = [r for env_rewards in episode_rewards for r in env_rewards]
     return agent, all_rewards
 
@@ -2064,7 +2121,6 @@ def evaluate_and_save_gif(agent: DreamerV3, env_name: str, num_episodes: int = 5
         while not done:
             frames.append(env.render())
 
-            # Single env eval
             action, state_list = agent.act(
                 np.expand_dims(obs, 0), [state] if state else None, training=False
             )
@@ -2120,9 +2176,9 @@ def main():
     environments = [
         # "CartPole-v1",
         # "Pendulum-v1",
+        "CarRacing-v3",
         "BipedalWalker-v3",
         "LunarLander-v3",
-        "CarRacing-v3",
         "Ant-v5",
         "ALE/Pong-v5",
     ]
