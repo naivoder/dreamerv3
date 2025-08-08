@@ -2181,7 +2181,10 @@ def main():
             print(f"{header_msg}")
             print(f"{separator}")
 
-            total_steps = 2_000_000
+            if "ALE" in env_name:
+                total_steps = 10_000_000
+            else:
+                total_steps = 2_000_000
 
             start_time = datetime.now()
             agent, rewards = train_dreamer(env_name, total_steps)
