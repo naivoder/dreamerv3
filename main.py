@@ -64,7 +64,7 @@ def spinning_cursor():
 class Config:
     batch_size: int = 16
     sequence_length: int = 64
-    replay_ratio: int = 128
+    replay_ratio: int = 32
     buffer_size: int = 5_000_000
     deter_size: int = 1024
     stoch_size: int = 16
@@ -673,10 +673,8 @@ class Actor(nn.Module):
         if discrete:
             self.head = nn.Linear(config.hidden_size, action_dim)
         else:
-            # Output both mean and log_std
             self.head = nn.Linear(config.hidden_size, action_dim * 2)
 
-            # Register action bounds for continuous actions
             if action_low is not None and action_high is not None:
                 self.register_buffer(
                     "action_scale",
@@ -695,7 +693,6 @@ class Actor(nn.Module):
                     ),
                 )
             else:
-                # Default to [-1, 1] if bounds not provided
                 self.register_buffer(
                     "action_scale", torch.ones(action_dim, device=self.device)
                 )
@@ -725,42 +722,34 @@ class Actor(nn.Module):
                 action = dist.rsample()
                 log_prob = dist.log_prob(action)
                 entropy = dist.entropy()
-                # For discrete, convert one-hot back to indices
                 action_indices = torch.argmax(action, dim=-1)
                 return action_indices, log_prob, entropy
             else:
-                # Return mode (most likely action)
                 return torch.argmax(dist.mode, dim=-1)
         else:
-            # Continuous actions
             output = self.head(h)
             mean, log_std = output.chunk(2, dim=-1)
 
-            # Constrain log_std to reasonable range using tanh
+            # Constrain log_std to reasonable range
             log_std_min, log_std_max = -5.0, 2.0
             log_std = log_std_min + (log_std_max - log_std_min) / 2 * (
                 torch.tanh(log_std) + 1
             )
             std = torch.exp(log_std)
 
-            # Create normal distribution
             distribution = D.Normal(mean, std)
 
             if training:
-                # Sample action
                 sample = distribution.rsample()
                 sample_tanh = torch.tanh(sample)
                 action = sample_tanh * self.action_scale + self.action_bias
 
-                # Compute log probability with correction for tanh squashing
                 log_prob = distribution.log_prob(sample)
                 # Correction term: -log|det(d(tanh)/dx)| = -log(1 - tanh^2(x))
                 log_prob -= torch.log(
                     self.action_scale * (1 - sample_tanh.pow(2)) + 1e-6
                 )
                 log_prob = log_prob.sum(dim=-1)  # Sum over action dimensions
-
-                # Entropy
                 entropy = distribution.entropy().sum(dim=-1)
 
                 return action, log_prob, entropy
@@ -823,7 +812,6 @@ class ReturnNormalizer(nn.Module):
         )
 
     def update(self, values: torch.Tensor):
-        """Update running statistics with new values."""
         with torch.no_grad():
             values = values.detach().flatten()
 
@@ -837,20 +825,6 @@ class ReturnNormalizer(nn.Module):
                 self.scale = torch.max(
                     torch.tensor(self.limit, device=values.device), self.high - self.low
                 )
-
-    def normalize(self, values: torch.Tensor) -> torch.Tensor:
-        # Center around the midpoint and scale
-        # This is more robust than dividing by scale alone
-        center = (self.high + self.low) / 2
-        return (values - center) / self.scale
-
-    def denormalize(self, normalized_values: torch.Tensor) -> torch.Tensor:
-        center = (self.high + self.low) / 2
-        return normalized_values * self.scale + center
-
-    @property
-    def inverse_scale(self):
-        return self.scale
 
 
 class WorldModel(nn.Module):
@@ -1191,7 +1165,6 @@ class DreamerV3:
                             self.device
                         )
                     else:
-                        # For continuous actions, the action dim is head.out_features // 2
                         action_dim = self.actor.head.out_features // 2
                         prev_action = torch.zeros(1, action_dim).to(self.device)
                 else:
@@ -1222,7 +1195,6 @@ class DreamerV3:
 
             feat = self.world_model.decoder.get_feat(new_states)
 
-            # Use the new Actor interface
             if training:
                 if self.discrete:
                     action_t, _, _ = self.actor(feat, training=True)
@@ -1235,14 +1207,12 @@ class DreamerV3:
 
             for i in range(num_envs):
                 if self.discrete:
-                    # For discrete, action_t is already the action index
                     action = actions_np[i]
                     action_onehot = np.zeros(self.actor.head.out_features)
                     action_onehot[action] = 1.0
                     self.prev_actions[i] = action_onehot
                     actions_np[i] = action
                 else:
-                    # For continuous, action is already properly bounded by the Actor
                     self.prev_actions[i] = actions_np[i]
 
                 self.prev_states[i] = {
@@ -1481,8 +1451,13 @@ class DreamerV3:
             for t in range(horizon):
                 feat = self.world_model.decoder.get_feat(state)
                 action, _, _ = self.actor(feat, training=True)
-
-                state = self.world_model.rssm.imagine(action, state)
+                if self.discrete:
+                    action_onehot = F.one_hot(
+                        action, num_classes=self.actor.head.out_features
+                    ).float()
+                    state = self.world_model.rssm.imagine(action_onehot, state)
+                else:
+                    state = self.world_model.rssm.imagine(action, state)
                 all_states.append({k: v.clone() for k, v in state.items()})
 
                 _, reward_logits, continue_logits = self.world_model.decoder(state)
@@ -1582,7 +1557,14 @@ class DreamerV3:
                     feat = self.world_model.decoder.get_feat(state)
                     action, _, _ = self.actor(feat, training=True)
 
-                    state = self.world_model.rssm.imagine(action, state)
+                    # Convert discrete action indices to one-hot for RSSM
+                    if self.discrete:
+                        action_onehot = F.one_hot(
+                            action, num_classes=self.actor.head.out_features
+                        ).float()
+                        state = self.world_model.rssm.imagine(action_onehot, state)
+                    else:
+                        state = self.world_model.rssm.imagine(action, state)
                     im_states.append({k: v.clone() for k, v in state.items()})
 
                     _, reward_logits, continue_logits = self.world_model.decoder(state)
@@ -1713,7 +1695,14 @@ class DreamerV3:
             log_probs.append(log_prob)
             entropies.append(entropy)
 
-            state = self.world_model.rssm.imagine(action, state)
+            # Convert discrete action indices to one-hot for RSSM
+            if self.discrete:
+                action_onehot = F.one_hot(
+                    action, num_classes=self.actor.head.out_features
+                ).float()
+                state = self.world_model.rssm.imagine(action_onehot, state)
+            else:
+                state = self.world_model.rssm.imagine(action, state)
 
         with torch.no_grad():
             batch_size = initial_state["deter"].shape[0]
@@ -1823,10 +1812,8 @@ class DreamerV3:
 def get_action_repeat(env_name: str) -> int:
     if "Atari" in env_name or "ALE" in env_name:
         return 4
-    elif "CarRacing" in env_name:
-        return 2
     else:
-        return 1
+        return 2
 
 
 def make_env(env_name: str):
@@ -1895,7 +1882,7 @@ def train_dreamer(
     update_count = 0
     best_reward = -float("inf")
 
-    warmup_steps = config.batch_size * config.sequence_length * 10
+    warmup_steps = config.batch_size * config.sequence_length
 
     spinner = spinning_cursor()
     start_time = time.time()
@@ -1960,7 +1947,7 @@ def train_dreamer(
                     else 0
                 )
 
-                separator = colored("━" * 85, Colors.DIM)
+                separator = colored("━" * 95, Colors.DIM)
                 print(f"\n{separator}")
 
                 env_header = colored(f"[{env_name}]", Colors.HEADER)
@@ -2176,18 +2163,18 @@ def main():
     environments = [
         # "CartPole-v1",
         # "Pendulum-v1",
-        "CarRacing-v3",
-        "BipedalWalker-v3",
         "LunarLander-v3",
         "Ant-v5",
+        "CarRacing-v3",
+        "BipedalWalker-v3",
         "ALE/Pong-v5",
     ]
 
     results = {}
+    separator = "=" * 95
 
     for env_name in environments:
         try:
-            separator = "=" * 85
             header_msg = colored(f"🚀 Training Dreamer-v3 on {env_name}", Colors.HEADER)
 
             print(f"\n{separator}")
@@ -2230,7 +2217,6 @@ def main():
             traceback.print_exc()
             exit()
 
-    separator = "=" * 85
     final_header = colored("✅ TRAINING COMPLETE - FINAL SUMMARY", Colors.HEADER)
 
     print(f"\n{separator}")
